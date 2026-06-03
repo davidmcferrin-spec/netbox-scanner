@@ -47,6 +47,7 @@ class ScannerConfig:
     prefixes: list[str] = field(default_factory=list)
     skip_ranges: list[str] = field(default_factory=list)
     skip_roles: list[str] = field(default_factory=lambda: ["DHCP Pool"])
+    lock_file: str = ""
     profiles: dict[str, list[str]] = field(
         default_factory=lambda: {
             "services": ["-sS", "-sU", "T:22,23,80,443,445,U:161"],
@@ -135,6 +136,7 @@ def load_config(path: str | None = None) -> AppConfig:
                 key: [str(item) for item in value]
                 for key, value in scanner.get("profiles", ScannerConfig().profiles).items()
             },
+            lock_file=str(scanner.get("lock_file", "")),
         ),
     )
     return config

@@ -75,6 +75,10 @@ scanner:
 
   prefixes: []
 
+  # Lock file while a scan is running (default: ~/.netbox-scanner.lock). Removed on normal exit or Ctrl+C.
+
+  lock_file: ""
+
   # IP range names whose addresses are excluded from prefix scans (exact name match).
 
   skip_ranges:

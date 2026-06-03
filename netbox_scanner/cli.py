@@ -25,6 +25,7 @@ from .netbox import (
     prefixes_for_display,
 )
 from .scanner import NetworkScanner, ScanResult, export_results, timing_for_speed
+from .run_lock import RunLockError, run_lock
 from .scheduler import run_on_schedule
 from .selection import prompt_prefix_selection, render_prefix_scan_plan, render_range_plan
 
@@ -553,6 +554,49 @@ def _run_scan(
 
     config = load_config(config_path)
     validate_config(config)
+    try:
+        with run_lock(config.scanner.lock_file):
+            _run_scan_locked(
+                config=config,
+                config_path=config_path,
+                ranges=ranges,
+                prefixes=prefixes,
+                skip_range_flags=skip_range_flags,
+                skip_role_flags=skip_role_flags,
+                profile=profile,
+                speed=speed,
+                dry_run=dry_run,
+                exclude_file=exclude_file,
+                output=output,
+                confirm=confirm,
+                auto_confirm=auto_confirm,
+                max_hosts=max_hosts,
+                interactive=interactive,
+                scheduled=scheduled,
+            )
+    except RunLockError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _run_scan_locked(
+    *,
+    config: AppConfig,
+    config_path: str | None,
+    ranges: tuple[str, ...],
+    prefixes: tuple[str, ...],
+    skip_range_flags: tuple[str, ...],
+    skip_role_flags: tuple[str, ...],
+    profile: str | None,
+    speed: str | None,
+    dry_run: bool,
+    exclude_file: str | None,
+    output: str | None,
+    confirm: bool,
+    auto_confirm: bool,
+    max_hosts: int | None,
+    interactive: bool,
+    scheduled: bool,
+) -> None:
     configure_logging(config.logging)
     chosen_profile = profile or config.scanner.default_profile
     chosen_speed = speed or config.scanner.default_speed

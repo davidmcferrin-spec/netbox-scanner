@@ -95,6 +95,8 @@ Use `--speed polite` or `--speed sneaky` and increase `scan_rate_limit` in confi
 
 During a run, prefixes and IP ranges are fetched once and cached on the client so setup does not repeat `prefixes.all()` or `ip_ranges.all()` before scanning.
 
+Only one scan may run at a time: the default lock file is `~/.netbox-scanner.lock` (override with `scanner.lock_file`). It is created when a run starts and removed on normal exit, errors, or Ctrl+C; stale locks from crashed processes are replaced automatically.
+
 DNS (PTR, A, CNAME) is collected for reporting and as an optional `dns_name` hint when writing to NetBox. DNS never gates liveness or blocks writes.
 
 ## Scan profiles
