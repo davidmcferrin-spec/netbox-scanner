@@ -48,10 +48,10 @@ Copy `config.example.yaml` and adjust values for your environment.
 
 ## Required NetBox API permissions
 
-The API token needs:
+The API token only needs:
 
-- Read access to IP ranges
-- Read/write access to IP addresses
+- `ipam > ip-ranges`: read
+- `ipam > ip-addresses`: read + write
 
 ## Usage
 
