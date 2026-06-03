@@ -1,0 +1,51 @@
+netbox:
+  # NetBox API base URL.
+  base_url: "https://netbox.example.com"
+  # NetBox API token with read access to IP ranges and write access to IP addresses.
+  api_token: "replace-me"
+  # HTTP timeout in seconds.
+  timeout: 30
+  # Delay in seconds between NetBox API calls.
+  rate_limit: 0.1
+
+dns:
+  # Optional custom recursive resolvers for PTR/A lookups.
+  servers:
+    - "1.1.1.1"
+    - "8.8.8.8"
+  # DNS lookup timeout in seconds.
+  timeout: 2
+
+logging:
+  # Python log level.
+  level: "INFO"
+  # Log file for stdout/file dual logging and scheduled runs.
+  file: "netbox-scanner.log"
+
+scanner:
+  # Default scan profile used when --profile is omitted.
+  default_profile: "default"
+  # Default speed used when --speed is omitted.
+  default_speed: "normal"
+  # Delay in seconds between nmap scans.
+  scan_rate_limit: 0.1
+  # ICMP ping timeout in seconds.
+  ping_timeout: 1
+  # Named scan profiles. Values can be port lists/ranges or raw nmap flags.
+  profiles:
+    default:
+      - "1-1024"
+    full:
+      - "1-65535"
+    web:
+      - "80"
+      - "443"
+      - "8080"
+      - "8443"
+    media:
+      - "554"
+      - "8554"
+      - "1935"
+    stealth:
+      - "-sS"
+      - "-Pn"
