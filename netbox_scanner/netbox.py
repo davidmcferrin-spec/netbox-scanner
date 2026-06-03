@@ -49,6 +49,7 @@ class RangeRecord:
     id: int = 0
     description: str = ""
     prefix: str | None = None
+    role_id: int | None = None
     role_name: str | None = None
     role_slug: str | None = None
 
@@ -72,6 +73,7 @@ def _as_mapping(record: Any) -> dict[str, Any]:
         "prefix": getattr(record, "prefix", None),
         "status": getattr(record, "status", None),
         "role": getattr(record, "role", None),
+        "role_id": getattr(record, "role_id", None),
         "reserved": getattr(record, "reserved", None),
         "excluded": getattr(record, "excluded", None),
         "custom_fields": getattr(record, "custom_fields", {}) or {},
@@ -135,23 +137,72 @@ def _prefix_cidr(prefix: Any) -> str | None:
     return str(prefix_value) if prefix_value else None
 
 
-def parse_role(role: Any) -> tuple[str | None, str | None]:
+def _parse_range_endpoint(value: str) -> str:
+    """NetBox IP ranges return host/mask (e.g. 10.207.2.1/22); keep host for overlap logic."""
+    text = str(value).strip()
+    if not text:
+        return text
+    if "/" in text:
+        return str(ipaddress.ip_interface(text).ip)
+    return str(ipaddress.ip_address(text))
+
+
+def build_role_catalog(api) -> dict[int, tuple[str | None, str | None]]:
+    """Map ipam role id to (name, slug) from /api/ipam/roles/."""
+    catalog: dict[int, tuple[str | None, str | None]] = {}
+    try:
+        for role in api.ipam.roles.all():
+            data = role if isinstance(role, dict) else _as_mapping(role)
+            role_id = data.get("id")
+            if role_id is None:
+                continue
+            name = data.get("name")
+            slug = data.get("slug")
+            catalog[int(role_id)] = (
+                str(name) if name else None,
+                str(slug) if slug else None,
+            )
+    except Exception as exc:
+        LOGGER.debug("Failed to fetch ipam roles catalog: %s", exc)
+    return catalog
+
+
+def parse_role(
+    role: Any,
+    *,
+    role_catalog: dict[int, tuple[str | None, str | None]] | None = None,
+) -> tuple[str | None, str | None, int | None]:
+    """Return role name, slug, and id when available."""
+    role_id: int | None = None
     if role is None:
-        return None, None
+        return None, None, None
     if isinstance(role, dict):
+        role_id_value = role.get("id")
+        if role_id_value is not None:
+            role_id = int(role_id_value)
         name = role.get("name")
         slug = role.get("slug")
         if not name and not slug:
             for key in ("label", "value"):
                 value = role.get(key)
                 if value:
-                    return str(value), None
-        return (str(name) if name else None), (str(slug) if slug else None)
+                    return str(value), None, role_id
+            if role_id is not None and role_catalog:
+                name, slug = role_catalog.get(role_id, (None, None))
+                return name, slug, role_id
+            return None, None, role_id
+        return (str(name) if name else None), (str(slug) if slug else None), role_id
+    role_id_value = getattr(role, "id", None)
+    if role_id_value is not None:
+        role_id = int(role_id_value)
     name = getattr(role, "name", None)
     slug = getattr(role, "slug", None)
     if name or slug:
-        return (str(name) if name else None), (str(slug) if slug else None)
-    return str(role), None
+        return (str(name) if name else None), (str(slug) if slug else None), role_id
+    if role_id is not None and role_catalog:
+        name, slug = role_catalog.get(role_id, (None, None))
+        return name, slug, role_id
+    return str(role), None, role_id
 
 
 def range_is_excluded(record: Any) -> bool:
@@ -378,17 +429,30 @@ def expand_prefixes_to_scan_cidrs(records: list[PrefixRecord], selected_cidrs: l
     return expanded
 
 
-def parse_range_record(record: Any, *, prefix: str | None = None) -> RangeRecord:
+def parse_range_record(
+    record: Any,
+    *,
+    prefix: str | None = None,
+    role_catalog: dict[int, tuple[str | None, str | None]] | None = None,
+) -> RangeRecord:
     data = _as_mapping(record)
-    role_name, role_slug = parse_role(data.get("role"))
+    role_name, role_slug, nested_role_id = parse_role(data.get("role"), role_catalog=role_catalog)
+    role_id_value = data.get("role_id")
+    role_id = int(role_id_value) if role_id_value is not None else nested_role_id
+    if role_id is not None and role_catalog and not role_name and not role_slug:
+        role_name, role_slug = role_catalog.get(role_id, (None, None))
+
+    start_raw = str(data.get("start_address", ""))
+    end_raw = str(data.get("end_address", ""))
     return RangeRecord(
         id=int(data.get("id") or 0),
         name=str(data.get("name", "")),
-        start_address=str(data.get("start_address", "")),
-        end_address=str(data.get("end_address", "")),
+        start_address=_parse_range_endpoint(start_raw) if start_raw else "",
+        end_address=_parse_range_endpoint(end_raw) if end_raw else "",
         description=str(data.get("description") or ""),
         excluded=range_is_excluded(data),
         prefix=prefix or _prefix_cidr(data.get("prefix")),
+        role_id=role_id,
         role_name=role_name,
         role_slug=role_slug,
     )
@@ -397,8 +461,8 @@ def parse_range_record(record: Any, *, prefix: str | None = None) -> RangeRecord
 def range_contained_in_prefix(record: Any, cidr: str) -> bool:
     data = _as_mapping(record)
     try:
-        start = ipaddress.ip_address(str(data.get("start_address", "")))
-        end = ipaddress.ip_address(str(data.get("end_address", "")))
+        start = ipaddress.ip_address(_parse_range_endpoint(str(data.get("start_address", ""))))
+        end = ipaddress.ip_address(_parse_range_endpoint(str(data.get("end_address", ""))))
         network = ipaddress.ip_network(cidr, strict=False)
     except ValueError:
         return False
@@ -409,8 +473,8 @@ def range_overlaps_prefix(record: Any, cidr: str) -> bool:
     """True when any part of the IP range overlaps the prefix (broader than full containment)."""
     data = _as_mapping(record)
     try:
-        start = ipaddress.ip_address(str(data.get("start_address", "")))
-        end = ipaddress.ip_address(str(data.get("end_address", "")))
+        start = ipaddress.ip_address(_parse_range_endpoint(str(data.get("start_address", ""))))
+        end = ipaddress.ip_address(_parse_range_endpoint(str(data.get("end_address", ""))))
         network = ipaddress.ip_network(cidr, strict=False)
     except ValueError:
         return False
@@ -425,8 +489,17 @@ def _normalize_role_token(value: str) -> str:
 
 
 def build_skip_role_match_keys(api, skip_roles: list[str]) -> set[str]:
-    """Normalized keys for matching range role name/slug to config skip_roles."""
+    keys, _, _ = build_skip_role_matchers(api, skip_roles)
+    return keys
+
+
+def build_skip_role_matchers(
+    api,
+    skip_roles: list[str],
+) -> tuple[set[str], set[int], dict[int, tuple[str | None, str | None]]]:
+    """Normalized name/slug keys, matching role ids, and full role catalog."""
     keys: set[str] = set()
+    role_ids: set[int] = set()
     config_norm: set[str] = set()
     for role in skip_roles:
         value = role.strip()
@@ -437,26 +510,22 @@ def build_skip_role_match_keys(api, skip_roles: list[str]) -> set[str]:
         keys.add(normalized)
         config_norm.add(normalized)
 
-    try:
-        for role in api.ipam.roles.all():
-            data = role if isinstance(role, dict) else _as_mapping(role)
-            name = data.get("name")
-            slug = data.get("slug")
-            name_norm = _normalize_role_token(str(name)) if name else None
-            slug_norm = _normalize_role_token(str(slug)) if slug else None
-            if (name_norm and name_norm in config_norm) or (slug_norm and slug_norm in config_norm):
-                if name_norm:
-                    keys.add(name_norm)
-                if slug_norm:
-                    keys.add(slug_norm)
-                if name:
-                    keys.add(str(name).lower())
-                if slug:
-                    keys.add(str(slug).lower())
-    except Exception as exc:
-        LOGGER.debug("Failed to fetch ipam roles for skip_roles matching: %s", exc)
+    catalog = build_role_catalog(api)
+    for role_id, (name, slug) in catalog.items():
+        name_norm = _normalize_role_token(name) if name else None
+        slug_norm = _normalize_role_token(slug) if slug else None
+        if (name_norm and name_norm in config_norm) or (slug_norm and slug_norm in config_norm):
+            role_ids.add(role_id)
+            if name_norm:
+                keys.add(name_norm)
+            if slug_norm:
+                keys.add(slug_norm)
+            if name:
+                keys.add(str(name).lower())
+            if slug:
+                keys.add(str(slug).lower())
 
-    return keys
+    return keys, role_ids, catalog
 
 
 def build_role_slug_index(api) -> dict[str, str]:
@@ -559,17 +628,53 @@ def collect_ranges_within_prefixes(api, prefix_cidrs: list[str]) -> list[RangeRe
     return ranges
 
 
+def union_prefix_cidrs(*cidr_groups: list[str] | None) -> list[str]:
+    """Deduped prefix list (e.g. selected parent /16 plus expanded child /24 scan CIDRs)."""
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in cidr_groups:
+        if not group:
+            continue
+        for cidr in group:
+            try:
+                normalized = str(ipaddress.ip_network(cidr, strict=False))
+            except ValueError:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+    return merged
+
+
+def _best_overlap_prefix(record: Any, prefix_cidrs: list[str]) -> str | None:
+    """Most specific prefix in the list that overlaps the range (for table display)."""
+    best: str | None = None
+    best_prefixlen = -1
+    for cidr in prefix_cidrs:
+        if not range_overlaps_prefix(record, cidr):
+            continue
+        try:
+            prefixlen = ipaddress.ip_network(cidr, strict=False).prefixlen
+        except ValueError:
+            continue
+        if prefixlen > best_prefixlen:
+            best = cidr
+            best_prefixlen = prefixlen
+    return best
+
+
 def collect_ranges_by_skip_roles_for_prefixes(
     api,
     prefix_cidrs: list[str],
     skip_roles: list[str],
 ) -> list[RangeRecord]:
-    """IP ranges whose assigned role matches skip_roles and overlaps a scan prefix CIDR."""
+    """IP ranges whose assigned role matches skip_roles and overlaps a prefix in scope."""
     if not skip_roles or not prefix_cidrs:
         return []
 
-    match_keys = build_skip_role_match_keys(api, skip_roles)
-    if not match_keys:
+    match_keys, match_role_ids, role_catalog = build_skip_role_matchers(api, skip_roles)
+    if not match_keys and not match_role_ids:
         return []
 
     ranges: list[RangeRecord] = []
@@ -581,21 +686,43 @@ def collect_ranges_by_skip_roles_for_prefixes(
         LOGGER.debug("Failed to fetch all ip_ranges for skip_roles: %s", exc)
         return []
 
+    matched_roles = 0
+    matched_overlap = 0
     for record in all_records:
-        parsed = parse_range_record(record)
-        if not range_matches_skip_role(parsed, skip_roles, match_keys=match_keys):
+        parsed = parse_range_record(record, role_catalog=role_catalog)
+        if not range_matches_skip_role(
+            parsed,
+            skip_roles,
+            match_keys=match_keys,
+            role_ids=match_role_ids,
+        ):
             continue
+        matched_roles += 1
 
-        overlap_prefix: str | None = None
-        for cidr in prefix_cidrs:
-            if range_overlaps_prefix(record, cidr):
-                overlap_prefix = cidr
-                break
+        overlap_prefix = _best_overlap_prefix(record, prefix_cidrs)
         if overlap_prefix is None:
             continue
+        matched_overlap += 1
 
-        parsed_with_prefix = parse_range_record(record, prefix=overlap_prefix)
+        parsed_with_prefix = parse_range_record(
+            record,
+            prefix=overlap_prefix,
+            role_catalog=role_catalog,
+        )
         _append_unique_range(ranges, seen_ids, parsed_with_prefix)
+
+    if matched_roles and not ranges:
+        LOGGER.warning(
+            "Found %s IP range(s) with skip role(s) %s but none overlap scan prefixes: %s",
+            matched_roles,
+            skip_roles,
+            ", ".join(prefix_cidrs[:5]),
+        )
+    elif not matched_roles and skip_roles:
+        LOGGER.warning(
+            "No IP ranges matched skip_roles %s (check role names in config vs /api/ipam/roles/)",
+            skip_roles,
+        )
 
     return ranges
 
@@ -612,25 +739,35 @@ def range_matches_skip_role(
     skip_roles: list[str],
     *,
     match_keys: set[str] | None = None,
+    role_ids: set[int] | None = None,
     api: Any | None = None,
 ) -> bool:
     if not skip_roles:
         return False
 
     keys = match_keys
-    if keys is None:
+    ids = role_ids
+    if keys is None or ids is None:
         if api is not None:
-            keys = build_skip_role_match_keys(api, skip_roles)
+            built_keys, built_ids, _ = build_skip_role_matchers(api, skip_roles)
+            keys = built_keys if keys is None else keys
+            ids = built_ids if ids is None else ids
         else:
-            keys = set()
-            for role in skip_roles:
-                value = role.strip()
-                if not value:
-                    continue
-                keys.add(value.lower())
-                keys.add(_normalize_role_token(value))
-    if not keys:
+            if keys is None:
+                keys = set()
+                for role in skip_roles:
+                    value = role.strip()
+                    if not value:
+                        continue
+                    keys.add(value.lower())
+                    keys.add(_normalize_role_token(value))
+            if ids is None:
+                ids = set()
+    if not keys and not ids:
         return False
+
+    if record.role_id is not None and record.role_id in ids:
+        return True
 
     candidates: set[str] = set()
     if record.role_name:
@@ -676,20 +813,23 @@ def range_exclusion_reason(
 
 def collect_exclusion_ranges_for_prefixes(
     api,
-    prefix_cidrs: list[str],
+    scan_prefix_cidrs: list[str],
     skip_names: list[str],
     skip_roles: list[str],
+    *,
+    selected_prefix_cidrs: list[str] | None = None,
 ) -> list[RangeRecord]:
     """IP range spans to exclude from prefix host scans (not whole prefixes)."""
     skip_name_set = set(skip_names)
     exclusions: list[RangeRecord] = []
     seen_ids: set[int] = set()
+    scope_cidrs = union_prefix_cidrs(selected_prefix_cidrs, scan_prefix_cidrs)
 
-    for record in collect_ranges_within_prefixes(api, prefix_cidrs):
+    for record in collect_ranges_within_prefixes(api, scope_cidrs):
         if record.excluded or record.name in skip_name_set:
             _append_unique_range(exclusions, seen_ids, record)
 
-    for record in collect_ranges_by_skip_roles_for_prefixes(api, prefix_cidrs, skip_roles):
+    for record in collect_ranges_by_skip_roles_for_prefixes(api, scope_cidrs, skip_roles):
         _append_unique_range(exclusions, seen_ids, record)
 
     return exclusions
@@ -859,12 +999,20 @@ class NetBoxClient:
 
     def fetch_exclusion_ranges_for_prefixes(
         self,
-        prefix_cidrs: list[str],
+        scan_prefix_cidrs: list[str],
         skip_names: list[str],
         skip_roles: list[str],
+        *,
+        selected_prefix_cidrs: list[str] | None = None,
     ) -> list[RangeRecord]:
         self._sleep()
-        return collect_exclusion_ranges_for_prefixes(self.api, prefix_cidrs, skip_names, skip_roles)
+        return collect_exclusion_ranges_for_prefixes(
+            self.api,
+            scan_prefix_cidrs,
+            skip_names,
+            skip_roles,
+            selected_prefix_cidrs=selected_prefix_cidrs,
+        )
 
     def fetch_scan_ranges(self, names: list[str]) -> list[RangeRecord]:
         self._sleep()

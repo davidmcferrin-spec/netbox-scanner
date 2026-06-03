@@ -236,6 +236,7 @@ class NetworkScanner:
         scan_prefixes: list[str] | None = None,
         skip_range_names: list[str] | None = None,
         skip_role_names: list[str] | None = None,
+        prefix_exclusion_ranges: list | None = None,
         profile: str,
         speed: str,
         exclude_file: str | None = None,
@@ -255,11 +256,14 @@ class NetworkScanner:
         if scan_prefixes is not None:
             if not scan_prefixes:
                 raise ValueError("No scan prefixes resolved from the selection.")
-            prefix_exclusions = self.netbox_client.fetch_exclusion_ranges_for_prefixes(
-                scan_prefixes,
-                skip_range_names or [],
-                skip_role_names or [],
-            )
+            if prefix_exclusion_ranges is not None:
+                prefix_exclusions = prefix_exclusion_ranges
+            else:
+                prefix_exclusions = self.netbox_client.fetch_exclusion_ranges_for_prefixes(
+                    scan_prefixes,
+                    skip_range_names or [],
+                    skip_role_names or [],
+                )
             exclusions.extend(range_records_to_exclusions(prefix_exclusions))
             targets = iter_unique_targets_from_prefixes(scan_prefixes, max_hosts=max_hosts)
             if not targets:

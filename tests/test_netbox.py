@@ -11,6 +11,7 @@ from netbox_scanner.netbox import (
     collect_exclusion_ranges_for_prefixes,
     collect_ranges_by_name,
     collect_ranges_by_skip_roles_for_prefixes,
+    range_overlaps_prefix,
     collect_ranges_within_prefixes,
     is_netbox_v2_token,
     iter_unique_targets,
@@ -202,10 +203,75 @@ class NetBoxTests(unittest.TestCase):
 
     def test_parse_role_extracts_name_and_slug(self):
         self.assertEqual(
-            ("DHCP Pool", "dhcp-pool"),
+            ("DHCP Pool", "dhcp-pool", None),
             parse_role({"name": "DHCP Pool", "slug": "dhcp-pool"}),
         )
-        self.assertEqual(("VIP", None), parse_role({"value": "VIP"}))
+        self.assertEqual(("VIP", None, None), parse_role({"value": "VIP"}))
+
+    def test_parse_role_resolves_id_only_nested_role_from_catalog(self):
+        catalog = {7: ("DHCP-Pool", "dhcp-pool")}
+        self.assertEqual(
+            ("DHCP-Pool", "dhcp-pool", 7),
+            parse_role({"id": 7, "url": "http://example/roles/7/"}, role_catalog=catalog),
+        )
+
+    def test_range_overlaps_prefix_with_netbox_cidr_endpoints(self):
+        record = {"start_address": "10.0.0.10/32", "end_address": "10.0.0.20/32"}
+        self.assertTrue(range_overlaps_prefix(record, "10.0.0.0/24"))
+
+    def test_nn_dhcp_pool_range_overlaps_selected_parent_not_only_child_scan(self):
+        """NetBox returns start/end with /22; pool sits in /22 under site /16."""
+        nn_range = {
+            "id": 6,
+            "name": "",
+            "start_address": "10.207.2.1/22",
+            "end_address": "10.207.3.254/22",
+            "role": {
+                "id": 1,
+                "name": "DHCP-Pool",
+                "slug": "dhcp-pool",
+            },
+        }
+        api = FakeAPI(
+            {},
+            all_ranges=[nn_range],
+            roles=[{"id": 1, "name": "DHCP-Pool", "slug": "dhcp-pool"}],
+        )
+        exclusions = collect_exclusion_ranges_for_prefixes(
+            api,
+            scan_prefix_cidrs=["10.207.10.0/24"],
+            skip_names=[],
+            skip_roles=["DHCP Pool"],
+            selected_prefix_cidrs=["10.207.0.0/16"],
+        )
+        self.assertEqual(1, len(exclusions))
+        self.assertEqual("10.207.2.1", exclusions[0].start_address)
+        self.assertEqual("10.207.3.254", exclusions[0].end_address)
+        self.assertEqual("DHCP-Pool", exclusions[0].role_name)
+
+    def test_collect_skip_roles_matches_role_id_only_on_range(self):
+        all_ranges = [
+            {
+                "id": 99,
+                "name": "dhcp-by-id",
+                "start_address": "10.0.0.40/32",
+                "end_address": "10.0.0.45/32",
+                "role": {"id": 7},
+            },
+        ]
+        api = FakeAPI(
+            {},
+            all_ranges=all_ranges,
+            roles=[{"id": 7, "name": "DHCP-Pool", "slug": "dhcp-pool"}],
+        )
+        exclusions = collect_ranges_by_skip_roles_for_prefixes(
+            api,
+            ["10.0.0.0/24"],
+            ["DHCP-Pool"],
+        )
+        self.assertEqual(1, len(exclusions))
+        self.assertEqual("dhcp-by-id", exclusions[0].name)
+        self.assertEqual("DHCP-Pool", exclusions[0].role_name)
 
     def test_parse_range_record_extracts_role(self):
         record = parse_range_record(

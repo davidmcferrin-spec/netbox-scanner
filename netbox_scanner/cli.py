@@ -512,6 +512,7 @@ def _resolve_scan_targets(
         scan_prefixes,
         skip_ranges,
         skip_roles,
+        selected_prefix_cidrs=selected_prefixes,
     )
 
     return ResolvedScanTargets(
@@ -652,6 +653,7 @@ def _run_scan(
         run_kwargs["scan_ranges"] = resolved.scan_ranges
     else:
         run_kwargs["scan_prefixes"] = resolved.scan_prefixes
+        run_kwargs["prefix_exclusion_ranges"] = resolved.exclusion_ranges
 
     if interactive:
         with Progress(
