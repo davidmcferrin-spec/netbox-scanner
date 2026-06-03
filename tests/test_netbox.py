@@ -7,8 +7,10 @@ from netbox_scanner.netbox import (
     NetBoxClient,
     apply_skip_ranges,
     apply_skip_roles,
+    build_skip_role_match_keys,
     collect_exclusion_ranges_for_prefixes,
     collect_ranges_by_name,
+    collect_ranges_by_skip_roles_for_prefixes,
     collect_ranges_within_prefixes,
     is_netbox_v2_token,
     iter_unique_targets,
@@ -235,7 +237,7 @@ class NetBoxTests(unittest.TestCase):
             ),
         ]
         filtered = apply_skip_roles(records, ["DHCP Pool"])
-        self.assertEqual(["static", "slug-only"], [record.name for record in filtered])
+        self.assertEqual(["static"], [record.name for record in filtered])
         filtered_by_slug = apply_skip_roles(records, ["dhcp-pool"])
         self.assertEqual(["static"], [record.name for record in filtered_by_slug])
 
@@ -249,7 +251,22 @@ class NetBoxTests(unittest.TestCase):
             )
         ]
         self.assertTrue(range_matches_skip_role(records[0], ["DHCP Pool"]))
+        self.assertTrue(range_matches_skip_role(records[0], ["dhcp pool"]))
         self.assertEqual([], apply_skip_roles(records, ["dhcp pool"]))
+
+    def test_range_matches_skip_role_hyphen_and_case_variants(self):
+        record = RangeRecord(
+            name="pool",
+            start_address="10.0.0.1",
+            end_address="10.0.0.2",
+            role_name="DHCP Pool",
+            role_slug="dhcp-pool",
+        )
+        api = FakeAPI({}, roles=[{"name": "DHCP-Pool", "slug": "dhcp-pool"}])
+        self.assertTrue(range_matches_skip_role(record, ["DHCP-Pool"], api=api))
+        self.assertTrue(range_matches_skip_role(record, ["dhcp pool"], api=api))
+        keys = build_skip_role_match_keys(api, ["DHCP-POOL"])
+        self.assertIn("dhcp-pool", keys)
 
     def test_apply_skip_roles_keeps_ranges_without_role(self):
         records = [RangeRecord(name="lab", start_address="10.0.0.1", end_address="10.0.0.1")]
@@ -288,25 +305,74 @@ class NetBoxTests(unittest.TestCase):
         slugs = resolve_skip_role_slugs(api, ["DHCP Pool"])
         self.assertEqual(["dhcp-pool"], slugs)
 
-    def test_collect_exclusion_ranges_fetches_skip_role_via_role_and_parent(self):
+    def test_collect_skip_roles_fetch_all_without_api_role_filter(self):
+        all_ranges = [
+            {
+                "id": 1,
+                "name": "dhcp-a",
+                "start_address": "10.0.0.10",
+                "end_address": "10.0.0.12",
+                "role": {"name": "DHCP-Pool", "slug": "dhcp-pool"},
+            },
+            {
+                "id": 2,
+                "name": "dhcp-b",
+                "start_address": "10.0.0.20",
+                "end_address": "10.0.0.22",
+                "role": {"name": "DHCP-Pool", "slug": "dhcp-pool"},
+            },
+            {
+                "id": 3,
+                "name": "dhcp-c",
+                "start_address": "10.0.0.30",
+                "end_address": "10.0.0.32",
+                "role": {"name": "DHCP-Pool", "slug": "dhcp-pool"},
+            },
+            {
+                "id": 4,
+                "name": "usable",
+                "start_address": "10.0.0.50",
+                "end_address": "10.0.0.55",
+            },
+        ]
+        api = FakeAPI(
+            {},
+            all_ranges=all_ranges,
+            roles=[{"name": "DHCP-Pool", "slug": "dhcp-pool"}],
+        )
+
+        exclusions = collect_ranges_by_skip_roles_for_prefixes(
+            api,
+            ["10.0.0.0/24"],
+            ["DHCP Pool"],
+        )
+
+        self.assertEqual(3, len(exclusions))
+        self.assertEqual(
+            ["dhcp-a", "dhcp-b", "dhcp-c"],
+            sorted(record.name for record in exclusions),
+        )
+
+    def test_collect_exclusion_ranges_fetches_skip_role_from_all_ranges(self):
         dhcp_range = {
             "id": 1,
             "name": "dhcp",
             "start_address": "10.0.0.10",
             "end_address": "10.0.0.20",
-            "role": {"name": "DHCP Pool", "slug": "dhcp-pool"},
+            "role": {"name": "DHCP-Pool", "slug": "dhcp-pool"},
         }
         api = FakeAPI(
             {},
+            all_ranges=[dhcp_range],
             parent_ranges={"10.0.0.0/24": []},
-            role_parent_ranges={("dhcp-pool", "10.0.0.0/24"): [dhcp_range]},
+            roles=[{"name": "DHCP-Pool", "slug": "dhcp-pool"}],
         )
 
         exclusions = collect_exclusion_ranges_for_prefixes(
             api,
             ["10.0.0.0/24"],
             skip_names=[],
-            skip_roles=["DHCP Pool"],
+            skip_roles=["DHCP-Pool"],
         )
 
         self.assertEqual(1, len(exclusions))

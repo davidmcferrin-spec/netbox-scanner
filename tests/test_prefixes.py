@@ -197,12 +197,13 @@ class PrefixHierarchyTests(unittest.TestCase):
             "name": "dhcp",
             "start_address": "10.0.0.10",
             "end_address": "10.0.0.20",
-            "role": {"name": "DHCP Pool", "slug": "dhcp-pool"},
+            "role": {"name": "DHCP-Pool", "slug": "dhcp-pool"},
         }
         api = FakeAPI(
             {},
+            all_ranges=[dhcp_range],
             parent_ranges={"10.0.0.0/24": []},
-            role_parent_ranges={("dhcp-pool", "10.0.0.0/24"): [dhcp_range]},
+            roles=[{"name": "DHCP-Pool", "slug": "dhcp-pool"}],
         )
 
         exclusions = collect_exclusion_ranges_for_prefixes(

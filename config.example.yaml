@@ -83,8 +83,8 @@ scanner:
 
     - "mgmt-excluded"
 
-  # IP range roles whose addresses are excluded from prefix scans (name or slug; case-insensitive).
-  # Default skips "DHCP Pool". Set to [] to disable role-based exclusions.
+  # IP range roles whose address spans are excluded inside scan prefixes (not whole subnets).
+  # Name or slug; case-insensitive (DHCP Pool, DHCP-Pool, dhcp-pool are equivalent). Set to [] to disable.
 
   skip_roles:
 

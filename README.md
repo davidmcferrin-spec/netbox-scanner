@@ -135,7 +135,7 @@ scanner:
 python -m netbox_scanner.cli --skip-range "reserved-loopbacks" --dry-run
 ```
 
-In **prefix mode**, `skip_roles` excludes **NetBox IP range** address spans (for example a DHCP pool from `10.0.0.50`–`10.0.0.200` inside a child `/24`), not whole prefixes or subnets. The scanner still enumerates all hosts in each scan prefix CIDR; only IPs inside matching ranges are skipped. Role names in config (for example `"DHCP Pool"`) are resolved to NetBox role slugs via `ipam/roles` for API queries. This is separate from `skip_ranges` (by range name) and from reserved/excluded ranges.
+In **prefix mode**, `skip_roles` excludes **NetBox IP range** address spans (for example a DHCP pool from `10.0.0.50`–`10.0.0.200` inside a child `/24`), not whole prefixes or subnets. The scanner loads all `ip_ranges` once, matches each range’s assigned role against config (case-insensitive; spaces and hyphens equivalent, e.g. `DHCP Pool` / `DHCP-Pool` / `dhcp-pool`), and skips only overlapping IPs. This is separate from `skip_ranges` (by range name) and from reserved/excluded ranges.
 
 ```yaml
 scanner:
