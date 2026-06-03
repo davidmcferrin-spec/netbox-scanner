@@ -48,7 +48,9 @@ class CliTests(unittest.TestCase):
 
         with patch("netbox_scanner.cli.load_config", return_value=config), patch(
             "netbox_scanner.cli.configure_logging"
-        ), patch("netbox_scanner.cli.run_on_schedule", side_effect=run_job_immediately):
+        ), patch("netbox_scanner.cli.NetBoxClient.verify_authentication"), patch(
+            "netbox_scanner.cli.run_on_schedule", side_effect=run_job_immediately
+        ):
             result = runner.invoke(main, ["--schedule", "0 * * * *"])
 
         self.assertNotEqual(0, result.exit_code)

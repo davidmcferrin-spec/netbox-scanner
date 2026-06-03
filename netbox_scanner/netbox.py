@@ -513,14 +513,55 @@ class NetBoxClient:
 
         status_code = getattr(getattr(exc, "req", None), "status_code", None)
         if status_code in (401, 403):
-            raise RuntimeError(f"NetBox authentication failed (HTTP {status_code}).") from exc
+            hint = (
+                " Check netbox.base_url and api_token in your config file. "
+                "Environment variables NETBOX_SCANNER_BASE_URL and NETBOX_SCANNER_API_TOKEN "
+                "override the config file when set."
+            )
+            raise RuntimeError(
+                f"NetBox authentication failed (HTTP {status_code}) for {self.base_url}.{hint}"
+            ) from exc
         if status_code is not None and status_code >= 500:
             raise RuntimeError(f"NetBox server error (HTTP {status_code}).") from exc
         raise exc
 
+    def verify_authentication(self) -> None:
+        """Probe /api/status/ with the same token and base URL the scanner uses."""
+        self._sleep()
+        url = f"{self.base_url.rstrip('/')}/api/status/"
+        try:
+            response = self.api.http_session.get(
+                url,
+                headers={
+                    "Authorization": f"Token {self.api_token}",
+                    "Accept": "application/json",
+                },
+                timeout=self.timeout,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"NetBox connection failed for {self.base_url}: {exc}") from exc
+
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"NetBox authentication failed (HTTP {response.status_code}) for {self.base_url}. "
+                "The API token was rejected (same check as GET /api/status/). "
+                "Ensure netbox.api_token in your config is valid. "
+                "If NETBOX_SCANNER_API_TOKEN or NETBOX_SCANNER_BASE_URL are set in the shell, "
+                "they override the config file."
+            )
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(
+                f"NetBox status check failed for {self.base_url} (HTTP {response.status_code})."
+            ) from exc
+
     def fetch_prefixes(self) -> list[PrefixRecord]:
         self._sleep()
-        return fetch_prefixes(self.api)
+        try:
+            return fetch_prefixes(self.api)
+        except Exception as exc:
+            self._handle_request_error(exc)
 
     def fetch_ranges_within_prefixes(self, prefix_cidrs: list[str]) -> list[RangeRecord]:
         self._sleep()

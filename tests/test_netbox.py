@@ -282,6 +282,25 @@ class NetBoxTests(unittest.TestCase):
         self.assertIs(api, fake_api)
         self.assertEqual(42.0, fake_api.http_session.timeout)
 
+    def test_verify_authentication_rejects_forbidden(self):
+        response = SimpleNamespace(status_code=403)
+
+        class FakeSession:
+            def get(self, url, headers=None, timeout=None):
+                self.url = url
+                self.headers = headers
+                return response
+
+        fake_api = FakeAPI({})
+        fake_api.http_session = FakeSession()
+        client = NetBoxClient("http://netbox.example.com", "bad-token", api=fake_api)
+
+        with self.assertRaisesRegex(RuntimeError, "authentication failed"):
+            client.verify_authentication()
+
+        self.assertEqual("http://netbox.example.com/api/status/", fake_api.http_session.url)
+        self.assertEqual("Token bad-token", fake_api.http_session.headers["Authorization"])
+
     def test_auth_errors_fail_fast(self):
         request_error = self._make_request_error(401)
         ip_addresses = MagicMock()

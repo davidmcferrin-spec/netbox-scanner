@@ -552,6 +552,16 @@ def _run_scan(
         timeout=config.netbox.timeout,
         rate_limit=config.netbox.rate_limit,
     )
+    try:
+        client.verify_authentication()
+    except RuntimeError as exc:
+        config_source = _config_source_label(config_path)
+        raise click.ClickException(
+            f"{exc} Config source: {config_source}. "
+            "Compare with: curl -H \"Authorization: Token $NETBOX_SCANNER_API_TOKEN\" "
+            f"{config.netbox.base_url.rstrip('/')}/api/status/"
+        ) from exc
+
     scanner = NetworkScanner(config=config, netbox_client=client)
 
     resolved = _resolve_scan_targets(
