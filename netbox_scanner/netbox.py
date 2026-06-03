@@ -405,6 +405,80 @@ def range_contained_in_prefix(record: Any, cidr: str) -> bool:
     return start in network and end in network
 
 
+def range_overlaps_prefix(record: Any, cidr: str) -> bool:
+    """True when any part of the IP range overlaps the prefix (broader than full containment)."""
+    data = _as_mapping(record)
+    try:
+        start = ipaddress.ip_address(str(data.get("start_address", "")))
+        end = ipaddress.ip_address(str(data.get("end_address", "")))
+        network = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+    if start in network or end in network:
+        return True
+    return int(start) <= int(network.broadcast_address) and int(end) >= int(network.network_address)
+
+
+def build_role_slug_index(api) -> dict[str, str]:
+    """Map lowercase role name or slug to canonical NetBox role slug."""
+    index: dict[str, str] = {}
+    try:
+        roles = api.ipam.roles.all()
+    except Exception as exc:
+        LOGGER.debug("Failed to fetch ipam roles: %s", exc)
+        return index
+    for role in roles:
+        data = role if isinstance(role, dict) else _as_mapping(role)
+        name = data.get("name")
+        slug = data.get("slug")
+        if slug:
+            slug_str = str(slug)
+            index[slug_str.lower()] = slug_str
+        if name and slug:
+            index[str(name).lower()] = str(slug)
+    return index
+
+
+def _slugify_role_guess(role: str) -> str:
+    return role.strip().lower().replace(" ", "-")
+
+
+def resolve_skip_role_slugs(api, skip_roles: list[str]) -> list[str]:
+    if not skip_roles:
+        return []
+    index = build_role_slug_index(api)
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for role in skip_roles:
+        key = role.strip().lower()
+        if not key:
+            continue
+        slug = index.get(key)
+        if slug is None:
+            slug = _slugify_role_guess(role)
+            LOGGER.warning(
+                "Skip role %r not found in NetBox ipam/roles; using slug guess %r",
+                role,
+                slug,
+            )
+        if slug not in seen:
+            seen.add(slug)
+            resolved.append(slug)
+    return resolved
+
+
+def _append_unique_range(
+    ranges: list[RangeRecord],
+    seen_ids: set[int],
+    record: RangeRecord,
+) -> None:
+    if record.id:
+        if record.id in seen_ids:
+            return
+        seen_ids.add(record.id)
+    ranges.append(record)
+
+
 def fetch_prefixes(api) -> list[PrefixRecord]:
     return [parse_prefix_record(record) for record in api.ipam.prefixes.all()]
 
@@ -424,9 +498,9 @@ def collect_ranges_within_prefixes(api, prefix_cidrs: list[str]) -> list[RangeRe
     for cidr in prefix_cidrs:
         candidates: list[Any] = []
         try:
-            candidates = list(api.ipam.ip_ranges.filter(within=cidr))
+            candidates = list(api.ipam.ip_ranges.filter(parent=cidr))
         except Exception as exc:
-            LOGGER.debug("NetBox within filter failed for %s: %s", cidr, exc)
+            LOGGER.debug("NetBox parent filter failed for %s: %s", cidr, exc)
             candidates = []
 
         if not candidates:
@@ -440,11 +514,57 @@ def collect_ranges_within_prefixes(api, prefix_cidrs: list[str]) -> list[RangeRe
             if not range_contained_in_prefix(record, cidr):
                 continue
             parsed = parse_range_record(record, prefix=cidr)
-            if parsed.id:
-                if parsed.id in seen_ids:
+            _append_unique_range(ranges, seen_ids, parsed)
+
+    return ranges
+
+
+def collect_ranges_by_skip_roles_for_prefixes(
+    api,
+    prefix_cidrs: list[str],
+    skip_roles: list[str],
+) -> list[RangeRecord]:
+    """Fetch IP ranges with skip-role slugs inside each scan prefix (child subnet CIDR)."""
+    if not skip_roles or not prefix_cidrs:
+        return []
+
+    role_slugs = resolve_skip_role_slugs(api, skip_roles)
+    if not role_slugs:
+        return []
+
+    ranges: list[RangeRecord] = []
+    seen_ids: set[int] = set()
+
+    for cidr in prefix_cidrs:
+        for slug in role_slugs:
+            candidates: list[Any] = []
+            try:
+                candidates = list(api.ipam.ip_ranges.filter(role=slug, parent=cidr))
+            except Exception as exc:
+                LOGGER.debug(
+                    "NetBox role+parent filter failed for role=%s parent=%s: %s",
+                    slug,
+                    cidr,
+                    exc,
+                )
+                candidates = []
+
+            if not candidates:
+                try:
+                    candidates = [
+                        record
+                        for record in api.ipam.ip_ranges.filter(role=slug)
+                        if range_overlaps_prefix(record, cidr)
+                    ]
+                except Exception as exc:
+                    LOGGER.debug("NetBox role filter failed for role=%s: %s", slug, exc)
+                    candidates = []
+
+            for record in candidates:
+                if not range_overlaps_prefix(record, cidr):
                     continue
-                seen_ids.add(parsed.id)
-            ranges.append(parsed)
+                parsed = parse_range_record(record, prefix=cidr)
+                _append_unique_range(ranges, seen_ids, parsed)
 
     return ranges
 
@@ -506,18 +626,17 @@ def collect_exclusion_ranges_for_prefixes(
     skip_names: list[str],
     skip_roles: list[str],
 ) -> list[RangeRecord]:
+    """IP range spans to exclude from prefix host scans (not whole prefixes)."""
     skip_name_set = set(skip_names)
     exclusions: list[RangeRecord] = []
     seen_ids: set[int] = set()
 
     for record in collect_ranges_within_prefixes(api, prefix_cidrs):
-        if range_exclusion_reason(record, skip_names=skip_name_set, skip_roles=skip_roles) is None:
-            continue
-        if record.id:
-            if record.id in seen_ids:
-                continue
-            seen_ids.add(record.id)
-        exclusions.append(record)
+        if record.excluded or record.name in skip_name_set:
+            _append_unique_range(exclusions, seen_ids, record)
+
+    for record in collect_ranges_by_skip_roles_for_prefixes(api, prefix_cidrs, skip_roles):
+        _append_unique_range(exclusions, seen_ids, record)
 
     return exclusions
 

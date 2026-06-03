@@ -192,40 +192,17 @@ class PrefixHierarchyTests(unittest.TestCase):
         self.assertEqual(["10.0.0.1", "10.0.0.2"], targets)
 
     def test_collect_exclusion_ranges_for_prefixes(self):
+        dhcp_range = {
+            "id": 1,
+            "name": "dhcp",
+            "start_address": "10.0.0.10",
+            "end_address": "10.0.0.20",
+            "role": {"name": "DHCP Pool", "slug": "dhcp-pool"},
+        }
         api = FakeAPI(
             {},
-            all_ranges=[
-                {
-                    "id": 1,
-                    "name": "dhcp",
-                    "start_address": "10.0.0.10",
-                    "end_address": "10.0.0.20",
-                    "role": {"name": "DHCP Pool", "slug": "dhcp-pool"},
-                },
-                {
-                    "id": 2,
-                    "name": "usable",
-                    "start_address": "10.0.0.50",
-                    "end_address": "10.0.0.60",
-                },
-            ],
-            within_ranges={
-                "10.0.0.0/24": [
-                    {
-                        "id": 1,
-                        "name": "dhcp",
-                        "start_address": "10.0.0.10",
-                        "end_address": "10.0.0.20",
-                        "role": {"name": "DHCP Pool", "slug": "dhcp-pool"},
-                    },
-                    {
-                        "id": 2,
-                        "name": "usable",
-                        "start_address": "10.0.0.50",
-                        "end_address": "10.0.0.60",
-                    },
-                ]
-            },
+            parent_ranges={"10.0.0.0/24": []},
+            role_parent_ranges={("dhcp-pool", "10.0.0.0/24"): [dhcp_range]},
         )
 
         exclusions = collect_exclusion_ranges_for_prefixes(

@@ -7,6 +7,7 @@ from netbox_scanner.netbox import (
     NetBoxClient,
     apply_skip_ranges,
     apply_skip_roles,
+    collect_exclusion_ranges_for_prefixes,
     collect_ranges_by_name,
     collect_ranges_within_prefixes,
     is_netbox_v2_token,
@@ -20,21 +21,49 @@ from netbox_scanner.netbox import (
     range_is_excluded,
     range_matches_skip_role,
     record_dns_name,
+    resolve_skip_role_slugs,
 )
 from netbox_scanner.netbox import RangeRecord
+from netbox_scanner.scanner import is_excluded, range_records_to_exclusions
+
+
+class FakeRoles:
+    def __init__(self, roles=None):
+        self.roles = roles or [{"name": "DHCP Pool", "slug": "dhcp-pool"}]
+
+    def all(self):
+        return self.roles
 
 
 class FakeIPRanges:
-    def __init__(self, responses=None, all_ranges=None, within_ranges=None):
+    def __init__(
+        self,
+        responses=None,
+        all_ranges=None,
+        within_ranges=None,
+        parent_ranges=None,
+        role_parent_ranges=None,
+        role_ranges=None,
+    ):
         self.responses = responses or {}
         self.all_ranges = all_ranges or []
-        self.within_ranges = within_ranges or {}
+        self.parent_ranges = parent_ranges if parent_ranges is not None else (within_ranges or {})
+        self.role_parent_ranges = role_parent_ranges or {}
+        self.role_ranges = role_ranges or {}
 
     def filter(self, **kwargs):
         if "name" in kwargs:
             return self.responses.get(kwargs["name"], [])
+        role = kwargs.get("role")
+        parent = kwargs.get("parent")
+        if role is not None and parent is not None:
+            return self.role_parent_ranges.get((role, parent), [])
+        if parent is not None:
+            return self.parent_ranges.get(parent, [])
+        if role is not None:
+            return self.role_ranges.get(role, [])
         if "within" in kwargs:
-            return self.within_ranges.get(kwargs["within"], [])
+            return self.parent_ranges.get(kwargs["within"], [])
         return []
 
     def all(self):
@@ -63,9 +92,28 @@ class FakeIPAddresses:
 
 
 class FakeAPI:
-    def __init__(self, responses, ip_addresses=None, all_ranges=None, within_ranges=None, prefixes=None):
+    def __init__(
+        self,
+        responses,
+        ip_addresses=None,
+        all_ranges=None,
+        within_ranges=None,
+        parent_ranges=None,
+        role_parent_ranges=None,
+        role_ranges=None,
+        roles=None,
+        prefixes=None,
+    ):
         self.ipam = SimpleNamespace(
-            ip_ranges=FakeIPRanges(responses, all_ranges=all_ranges, within_ranges=within_ranges),
+            ip_ranges=FakeIPRanges(
+                responses,
+                all_ranges=all_ranges,
+                within_ranges=within_ranges,
+                parent_ranges=parent_ranges,
+                role_parent_ranges=role_parent_ranges,
+                role_ranges=role_ranges,
+            ),
+            roles=FakeRoles(roles),
             ip_addresses=ip_addresses or FakeIPAddresses(),
             prefixes=FakePrefixes(prefixes or []),
         )
@@ -229,11 +277,82 @@ class NetBoxTests(unittest.TestCase):
                 {"id": 3, "name": "lab", "start_address": "10.0.0.50", "end_address": "10.0.0.55"},
                 {"id": 4, "name": "other", "start_address": "10.1.0.1", "end_address": "10.1.0.2"},
             ],
-            within_ranges={"10.0.0.0/24": []},
+            parent_ranges={"10.0.0.0/24": []},
         )
         records = collect_ranges_within_prefixes(api, ["10.0.0.0/24"])
         self.assertEqual(1, len(records))
         self.assertEqual("lab", records[0].name)
+
+    def test_resolve_skip_role_slugs_maps_display_name_to_slug(self):
+        api = FakeAPI({})
+        slugs = resolve_skip_role_slugs(api, ["DHCP Pool"])
+        self.assertEqual(["dhcp-pool"], slugs)
+
+    def test_collect_exclusion_ranges_fetches_skip_role_via_role_and_parent(self):
+        dhcp_range = {
+            "id": 1,
+            "name": "dhcp",
+            "start_address": "10.0.0.10",
+            "end_address": "10.0.0.20",
+            "role": {"name": "DHCP Pool", "slug": "dhcp-pool"},
+        }
+        api = FakeAPI(
+            {},
+            parent_ranges={"10.0.0.0/24": []},
+            role_parent_ranges={("dhcp-pool", "10.0.0.0/24"): [dhcp_range]},
+        )
+
+        exclusions = collect_exclusion_ranges_for_prefixes(
+            api,
+            ["10.0.0.0/24"],
+            skip_names=[],
+            skip_roles=["DHCP Pool"],
+        )
+
+        self.assertEqual(1, len(exclusions))
+        self.assertEqual("dhcp", exclusions[0].name)
+        self.assertEqual("10.0.0.10", exclusions[0].start_address)
+
+    def test_skip_role_excludes_only_range_ips_not_whole_prefix(self):
+        dhcp_range = RangeRecord(
+            id=1,
+            name="dhcp",
+            start_address="10.0.0.10",
+            end_address="10.0.0.12",
+            role_name="DHCP Pool",
+            role_slug="dhcp-pool",
+        )
+        exclusions = range_records_to_exclusions([dhcp_range])
+
+        self.assertTrue(is_excluded("10.0.0.10", exclusions))
+        self.assertTrue(is_excluded("10.0.0.11", exclusions))
+        self.assertFalse(is_excluded("10.0.0.50", exclusions))
+
+    def test_collect_exclusion_ranges_includes_reserved_by_name(self):
+        api = FakeAPI(
+            {},
+            parent_ranges={
+                "10.0.0.0/24": [
+                    {
+                        "id": 10,
+                        "name": "reserved-block",
+                        "start_address": "10.0.0.1",
+                        "end_address": "10.0.0.2",
+                        "status": {"value": "reserved"},
+                    },
+                ],
+            },
+        )
+
+        exclusions = collect_exclusion_ranges_for_prefixes(
+            api,
+            ["10.0.0.0/24"],
+            skip_names=["skip-by-name"],
+            skip_roles=[],
+        )
+
+        self.assertEqual(1, len(exclusions))
+        self.assertEqual("reserved-block", exclusions[0].name)
 
     def test_normalize_hostname_strips_trailing_dot_and_lowercases(self):
         self.assertEqual("host.example.com", normalize_hostname("Host.Example.COM."))
