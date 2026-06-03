@@ -7,9 +7,9 @@ from rich.table import Table
 from .netbox import (
     PrefixRecord,
     children_by_parent,
-    count_leaf_descendants,
     range_exclusion_reason,
     range_matches_skip_role,
+    scan_preview_for_prefix,
 )
 
 
@@ -34,6 +34,25 @@ def parse_prefix_selection(raw: str, total: int) -> list[int]:
     return indices
 
 
+def render_child_prefixes_table(
+    display_prefixes: list[PrefixRecord],
+    *,
+    all_prefixes: list[PrefixRecord] | None = None,
+    console: Console | None = None,
+) -> None:
+    children = children_by_parent(all_prefixes or display_prefixes)
+    output = console or Console()
+    table = Table(title="Child Prefixes To Scan")
+    table.add_column("Parent / standalone")
+    table.add_column("Child prefixes to scan")
+    for prefix in display_prefixes:
+        table.add_row(
+            prefix.prefix,
+            scan_preview_for_prefix(prefix, children=children),
+        )
+    output.print(table)
+
+
 def prompt_prefix_selection(
     prefixes: list[PrefixRecord],
     *,
@@ -43,25 +62,23 @@ def prompt_prefix_selection(
     if not prefixes:
         raise click.ClickException("No NetBox prefixes found.")
 
-    children = children_by_parent(all_prefixes or prefixes)
     output = console or Console()
     table = Table(title="NetBox Prefixes")
     table.add_column("#", justify="right")
     table.add_column("Prefix")
     table.add_column("Description")
     table.add_column("Site")
-    table.add_column("Children", justify="right")
     for index, prefix in enumerate(prefixes, start=1):
-        child_count = count_leaf_descendants(prefix, children=children)
-        child_label = str(child_count) if child_count else "-"
         table.add_row(
             str(index),
             prefix.prefix,
             prefix.description,
             prefix.site or "",
-            child_label,
         )
     output.print(table)
+
+    if click.confirm("Show child prefixes?", default=False):
+        render_child_prefixes_table(prefixes, all_prefixes=all_prefixes, console=output)
 
     while True:
         raw = click.prompt(

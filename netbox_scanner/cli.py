@@ -2,28 +2,343 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 
 import click
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
-from .config import AppConfig, configure_logging, load_config, validate_config
+from .config import AppConfig, _select_config_path, configure_logging, load_config, validate_config
 from .netbox import (
     NetBoxClient,
+    RangeRecord,
     apply_skip_ranges,
     apply_skip_roles,
     expand_prefixes_to_scan_cidrs,
+    iter_unique_targets,
+    iter_unique_targets_from_prefixes,
     prefixes_for_display,
 )
-from .scanner import NetworkScanner, export_results
+from .scanner import NetworkScanner, ScanResult, export_results, timing_for_speed
 from .scheduler import run_on_schedule
 from .selection import prompt_prefix_selection, render_prefix_scan_plan, render_range_plan
+
+_CIDR_PREVIEW_LIMIT = 10
 
 
 LOGGER = logging.getLogger(__name__)
 console = Console()
+
+
+@dataclass(slots=True)
+class ResolvedScanTargets:
+    legacy_ranges: bool
+    selection_source: str
+    selected_display_prefixes: list[str] | None
+    scan_prefixes: list[str] | None
+    scan_ranges: list[RangeRecord] | None
+    legacy_plan_ranges: list[RangeRecord] | None
+    exclusion_ranges: list[RangeRecord] | None
+    skip_name_set: set[str]
+
+
+def _config_source_label(config_path: str | None) -> str:
+    if config_path:
+        return str(Path(config_path).expanduser())
+    selected = _select_config_path(None)
+    if selected and selected.exists():
+        return str(selected)
+    return "environment variables only"
+
+
+def _run_style(*, interactive: bool, scheduled: bool) -> str:
+    if scheduled:
+        return "scheduled"
+    if interactive:
+        return "interactive"
+    return "unattended"
+
+
+def _selection_source(
+    *,
+    ranges: tuple[str, ...],
+    prefixes: tuple[str, ...],
+    interactive: bool,
+    scheduled: bool,
+) -> str:
+    if ranges:
+        return "--ranges"
+    if prefixes:
+        return "--prefix"
+    if scheduled:
+        return "config prefixes (scheduled)"
+    if not sys.stdin.isatty():
+        return "config prefixes (non-interactive)"
+    return "interactive prefix picker"
+
+
+def _format_list_preview(items: list[str], *, limit: int = _CIDR_PREVIEW_LIMIT) -> str:
+    if not items:
+        return "-"
+    if len(items) <= limit:
+        return ", ".join(items)
+    shown = ", ".join(items[:limit])
+    return f"{shown}, ... (+{len(items) - limit} more)"
+
+
+def _write_mode_label(*, dry_run: bool, confirm: bool, auto_confirm: bool) -> str:
+    if dry_run:
+        return "dry-run (no NetBox writes)"
+    if auto_confirm:
+        return "auto-confirm (write all verified)"
+    if confirm:
+        return "confirm each write"
+    return "scan only (no writes unless --confirm or --auto-confirm)"
+
+
+def _profile_ports_label(config: AppConfig, profile: str) -> str:
+    items = config.scanner.profiles.get(profile, [])
+    ports = [item for item in items if not item.startswith("-")]
+    if ports:
+        return ", ".join(ports)
+    return "see config"
+
+
+def _preview_host_count(
+    resolved: ResolvedScanTargets,
+    *,
+    max_hosts: int | None,
+) -> tuple[str, int | None]:
+    try:
+        if resolved.legacy_ranges:
+            assert resolved.scan_ranges is not None
+            targets = iter_unique_targets(resolved.scan_ranges, max_hosts=max_hosts)
+        else:
+            assert resolved.scan_prefixes is not None
+            targets = iter_unique_targets_from_prefixes(resolved.scan_prefixes, max_hosts=max_hosts)
+        count = len(targets)
+        label = str(count)
+        if max_hosts is not None:
+            label = f"{count} (limit --max-hosts {max_hosts})"
+        return label, count
+    except ValueError as exc:
+        return f"preview failed: {exc}", None
+
+
+def render_run_configuration(
+    *,
+    config: AppConfig,
+    config_path: str | None,
+    resolved: ResolvedScanTargets,
+    profile: str,
+    speed: str,
+    skip_ranges: list[str],
+    skip_roles: list[str],
+    dry_run: bool,
+    confirm: bool,
+    auto_confirm: bool,
+    exclude_file: str | None,
+    output: str | None,
+    max_hosts: int | None,
+    interactive: bool,
+    scheduled: bool,
+    host_count_label: str,
+    console: Console | None = None,
+) -> None:
+    output_console = console or Console()
+    nmap_timing = timing_for_speed(speed)
+
+    table = Table(title="Run Configuration")
+    table.add_column("Setting")
+    table.add_column("Value")
+
+    table.add_row("Run style", _run_style(interactive=interactive, scheduled=scheduled))
+    table.add_row("Config source", _config_source_label(config_path))
+    table.add_row("Log level", config.logging.level)
+    table.add_row("Log file", config.logging.file)
+
+    table.add_row("NetBox URL", config.netbox.base_url)
+    table.add_row(
+        "API token",
+        "configured" if config.netbox.api_token.strip() else "missing",
+    )
+
+    target_mode = "legacy IP ranges" if resolved.legacy_ranges else "prefix"
+    table.add_row("Target mode", target_mode)
+    table.add_row("Selection source", resolved.selection_source)
+    if resolved.legacy_ranges:
+        range_names = [record.name for record in resolved.scan_ranges or []]
+        table.add_row("IP ranges to scan", _format_list_preview(range_names))
+    else:
+        table.add_row(
+            "Selected prefixes",
+            _format_list_preview(resolved.selected_display_prefixes or []),
+        )
+        table.add_row(
+            "Scan prefix CIDRs",
+            _format_list_preview(resolved.scan_prefixes or []),
+        )
+    table.add_row("Hosts to scan", host_count_label)
+
+    table.add_row("Profile", profile)
+    table.add_row("Nmap speed", f"{speed} ({nmap_timing})")
+    table.add_row("Profile ports/args", _profile_ports_label(config, profile))
+    table.add_row("Scan delay (s/host)", str(config.scanner.scan_rate_limit))
+    table.add_row("Ping timeout (s)", str(config.scanner.ping_timeout))
+    table.add_row(
+        "DNS servers",
+        ", ".join(config.dns.servers) if config.dns.servers else "(system default)",
+    )
+    table.add_row("DNS timeout (s)", str(config.dns.timeout))
+    table.add_row("NetBox HTTP timeout (s)", str(config.netbox.timeout))
+    table.add_row("NetBox API delay (s)", str(config.netbox.rate_limit))
+
+    table.add_row("Skip range names", _format_list_preview(skip_ranges))
+    table.add_row("Skip range roles", _format_list_preview(skip_roles))
+    table.add_row("Exclude file", exclude_file or "-")
+
+    table.add_row("NetBox writes", _write_mode_label(dry_run=dry_run, confirm=confirm, auto_confirm=auto_confirm))
+    table.add_row("Max hosts", str(max_hosts) if max_hosts is not None else "-")
+    table.add_row("Output", output or "-")
+
+    output_console.print(table)
+
+
+def log_run_configuration(
+    *,
+    config: AppConfig,
+    config_path: str | None,
+    resolved: ResolvedScanTargets,
+    profile: str,
+    speed: str,
+    dry_run: bool,
+    confirm: bool,
+    auto_confirm: bool,
+    exclude_file: str | None,
+    output: str | None,
+    max_hosts: int | None,
+    interactive: bool,
+    scheduled: bool,
+    host_count_label: str,
+) -> None:
+    target_mode = "legacy_ranges" if resolved.legacy_ranges else "prefix"
+    scan_cidr_count = len(resolved.scan_prefixes or [])
+    scan_range_count = len(resolved.scan_ranges or [])
+    LOGGER.info(
+        "Run configuration style=%s config_source=%s target_mode=%s selection_source=%s "
+        "profile=%s speed=%s nmap_timing=%s dry_run=%s confirm=%s auto_confirm=%s "
+        "hosts=%s scan_prefixes=%s scan_ranges=%s max_hosts=%s netbox_url=%s api_token_set=%s",
+        _run_style(interactive=interactive, scheduled=scheduled),
+        _config_source_label(config_path),
+        target_mode,
+        resolved.selection_source,
+        profile,
+        speed,
+        timing_for_speed(speed),
+        dry_run,
+        confirm,
+        auto_confirm,
+        host_count_label,
+        scan_cidr_count,
+        scan_range_count,
+        max_hosts,
+        config.netbox.base_url,
+        bool(config.netbox.api_token.strip()),
+    )
+
+
+def netbox_write_dns_name(result: ScanResult) -> str | None:
+    payload = result.netbox_payload or {}
+    dns_name = payload.get("dns_name")
+    if dns_name:
+        return str(dns_name)
+    if result.ptr_hostname:
+        return result.ptr_hostname
+    return None
+
+
+def format_dns_hostname_fields(result: ScanResult) -> str:
+    ptr = result.ptr_hostname or "-"
+    write_dns = netbox_write_dns_name(result) or "-"
+    parts = [f"PTR={ptr}", f"dns_name={write_dns}"]
+    if result.netbox_dns_name and result.netbox_status == "drift":
+        parts.append(f"NetBox-dns_name={result.netbox_dns_name}")
+    elif result.netbox_dns_name and result.netbox_status == "already_exists":
+        parts.append(f"NetBox-dns_name={result.netbox_dns_name}")
+    if result.forward_addresses:
+        parts.append(f"forward={','.join(result.forward_addresses)}")
+    return "  ".join(parts)
+
+
+def netbox_outcome_label(result: ScanResult) -> str:
+    status = result.netbox_status or ""
+    reason = result.reason or ""
+    dns_name = netbox_write_dns_name(result)
+
+    if result.netbox_written and status == "created":
+        if dns_name:
+            return f"added to NetBox (dns_name={dns_name})"
+        return "added to NetBox (no dns_name)"
+    if status == "already_exists":
+        if result.netbox_dns_name:
+            return f"already in NetBox (dns_name={result.netbox_dns_name})"
+        return "already in NetBox"
+    if status == "drift":
+        if result.netbox_dns_name and result.ptr_hostname:
+            return (
+                f"not added (DNS drift: NetBox={result.netbox_dns_name}, PTR={result.ptr_hostname})"
+            )
+        return "not added (DNS drift — report only)"
+    if status == "planned" and reason == "dry_run":
+        if dns_name:
+            return f"would add to NetBox (dry-run, dns_name={dns_name})"
+        return "would add to NetBox (dry-run, no dns_name)"
+    if status == "planned" and reason == "not_confirmed":
+        if dns_name:
+            return f"not added (not confirmed, dns_name={dns_name})"
+        return "not added (not confirmed)"
+    if status == "planned":
+        if dns_name:
+            return f"not added (pending approval, dns_name={dns_name})"
+        return "not added (pending approval)"
+    if status == "not_found" and reason == "dry_run":
+        if dns_name:
+            return f"would add to NetBox (dry-run, dns_name={dns_name})"
+        return "would add to NetBox (dry-run, no dns_name)"
+    if status:
+        return status.replace("_", " ")
+    return "no NetBox action"
+
+
+def format_verified_find_line(result: ScanResult) -> str:
+    ports = ",".join(str(port) for port in result.open_ports) or "-"
+    dns_fields = format_dns_hostname_fields(result)
+    netbox = netbox_outcome_label(result)
+    return f"FIND {result.ip}  {dns_fields}  ports={ports}  NetBox: {netbox}"
+
+
+def report_verified_find(
+    result: ScanResult,
+    *,
+    console: Console | None = None,
+    logger: logging.Logger | None = None,
+    print_to_console: bool = True,
+) -> None:
+    if result.liveness != "verified":
+        return
+    line = format_verified_find_line(result)
+    if logger is not None:
+        logger.info(line)
+    if print_to_console and console is not None:
+        ports = ",".join(str(port) for port in result.open_ports) or "-"
+        dns_fields = format_dns_hostname_fields(result)
+        console.print(
+            f"[bold green]FIND[/bold green] {result.ip}  {dns_fields}  ports={ports}  "
+            f"NetBox: [cyan]{netbox_outcome_label(result)}[/cyan]"
+        )
 
 
 def _render_summary(summary) -> None:
@@ -132,8 +447,14 @@ def _resolve_scan_targets(
     skip_roles: list[str],
     interactive: bool,
     scheduled: bool,
-):
+) -> ResolvedScanTargets:
     skip_name_set = set(skip_ranges)
+    selection_source = _selection_source(
+        ranges=ranges,
+        prefixes=prefixes,
+        interactive=interactive,
+        scheduled=scheduled,
+    )
 
     if ranges:
         all_ranges = client.fetch_scan_ranges(list(ranges))
@@ -143,14 +464,16 @@ def _resolve_scan_targets(
             raise click.ClickException(
                 "All IP ranges were skipped by skip_ranges or skip_roles configuration."
             )
-        if interactive:
-            render_range_plan(
-                all_ranges,
-                skipped_names=skip_name_set,
-                skip_roles=skip_roles,
-                console=console,
-            )
-        return None, scan_ranges
+        return ResolvedScanTargets(
+            legacy_ranges=True,
+            selection_source=selection_source,
+            selected_display_prefixes=None,
+            scan_prefixes=None,
+            scan_ranges=scan_ranges,
+            legacy_plan_ranges=all_ranges,
+            exclusion_ranges=None,
+            skip_name_set=skip_name_set,
+        )
 
     selected_prefixes: list[str]
     if prefixes:
@@ -185,16 +508,16 @@ def _resolve_scan_targets(
         skip_roles,
     )
 
-    if interactive:
-        render_prefix_scan_plan(
-            scan_prefixes=scan_prefixes,
-            exclusion_ranges=exclusion_ranges,
-            skip_names=skip_name_set,
-            skip_roles=skip_roles,
-            console=console,
-        )
-
-    return selected_prefixes, scan_prefixes
+    return ResolvedScanTargets(
+        legacy_ranges=False,
+        selection_source=selection_source,
+        selected_display_prefixes=selected_prefixes,
+        scan_prefixes=scan_prefixes,
+        scan_ranges=None,
+        legacy_plan_ranges=None,
+        exclusion_ranges=exclusion_ranges,
+        skip_name_set=skip_name_set,
+    )
 
 
 def _run_scan(
@@ -231,7 +554,7 @@ def _run_scan(
     )
     scanner = NetworkScanner(config=config, netbox_client=client)
 
-    _, targets = _resolve_scan_targets(
+    resolved = _resolve_scan_targets(
         client,
         config,
         ranges=ranges,
@@ -241,6 +564,60 @@ def _run_scan(
         interactive=interactive,
         scheduled=scheduled,
     )
+
+    host_count_label, _ = _preview_host_count(resolved, max_hosts=max_hosts)
+    render_run_configuration(
+        config=config,
+        config_path=config_path,
+        resolved=resolved,
+        profile=chosen_profile,
+        speed=chosen_speed,
+        skip_ranges=skip_ranges,
+        skip_roles=skip_roles,
+        dry_run=dry_run,
+        confirm=confirm,
+        auto_confirm=auto_confirm,
+        exclude_file=exclude_file,
+        output=output,
+        max_hosts=max_hosts,
+        interactive=interactive,
+        scheduled=scheduled,
+        host_count_label=host_count_label,
+        console=console,
+    )
+    log_run_configuration(
+        config=config,
+        config_path=config_path,
+        resolved=resolved,
+        profile=chosen_profile,
+        speed=chosen_speed,
+        dry_run=dry_run,
+        confirm=confirm,
+        auto_confirm=auto_confirm,
+        exclude_file=exclude_file,
+        output=output,
+        max_hosts=max_hosts,
+        interactive=interactive,
+        scheduled=scheduled,
+        host_count_label=host_count_label,
+    )
+
+    if interactive:
+        if resolved.legacy_ranges:
+            render_range_plan(
+                resolved.legacy_plan_ranges or [],
+                skipped_names=resolved.skip_name_set,
+                skip_roles=skip_roles,
+                console=console,
+            )
+        else:
+            render_prefix_scan_plan(
+                scan_prefixes=resolved.scan_prefixes or [],
+                exclusion_ranges=resolved.exclusion_ranges or [],
+                skip_names=resolved.skip_name_set,
+                skip_roles=skip_roles,
+                console=console,
+            )
 
     run_kwargs = {
         "profile": chosen_profile,
@@ -252,10 +629,10 @@ def _run_scan(
         "skip_range_names": skip_ranges,
         "skip_role_names": skip_roles,
     }
-    if ranges:
-        run_kwargs["scan_ranges"] = targets
+    if resolved.legacy_ranges:
+        run_kwargs["scan_ranges"] = resolved.scan_ranges
     else:
-        run_kwargs["scan_prefixes"] = targets
+        run_kwargs["scan_prefixes"] = resolved.scan_prefixes
 
     if interactive:
         with Progress(
@@ -282,6 +659,7 @@ def _run_scan(
             )
 
             def progress_callback(summary, result):
+                report_verified_find(result, console=console, logger=LOGGER)
                 progress.update(
                     task_id,
                     total=max(summary.total_hosts, 1),
@@ -299,10 +677,14 @@ def _run_scan(
                 progress_callback=progress_callback,
             )
     else:
+
+        def progress_callback(summary, result):
+            report_verified_find(result, console=console, logger=LOGGER)
+
         summary = scanner.run(
             **run_kwargs,
             approval_callback=None,
-            progress_callback=None,
+            progress_callback=progress_callback,
         )
 
     _log_summary(summary)

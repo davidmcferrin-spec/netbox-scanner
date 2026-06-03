@@ -2,10 +2,13 @@ import unittest
 
 from netbox_scanner.netbox import (
     PrefixRecord,
+    children_by_parent,
     collect_exclusion_ranges_for_prefixes,
     expand_prefixes_to_scan_cidrs,
     iter_unique_targets_from_prefixes,
+    leaf_child_prefixes_for_parent,
     prefixes_for_display,
+    scan_preview_for_prefix,
 )
 from tests.test_netbox import FakeAPI
 
@@ -64,6 +67,37 @@ class PrefixHierarchyTests(unittest.TestCase):
         expanded = expand_prefixes_to_scan_cidrs(records, ["10.114.50.0/24"])
 
         self.assertEqual(["10.114.50.0/24"], expanded)
+
+    def test_leaf_child_prefixes_for_parent_returns_sorted_leaves(self):
+        records = [
+            _record(1, "10.114.0.0/16"),
+            _record(2, "10.114.51.0/24", parent_id=1),
+            _record(3, "10.114.50.0/24", parent_id=1),
+        ]
+        children = children_by_parent(records)
+
+        leaves = leaf_child_prefixes_for_parent(1, children=children)
+
+        self.assertEqual(["10.114.50.0/24", "10.114.51.0/24"], leaves)
+
+    def test_scan_preview_for_parent_lists_child_cidrs(self):
+        records = [
+            _record(1, "10.114.0.0/16"),
+            _record(2, "10.114.50.0/24", parent_id=1),
+        ]
+        children = children_by_parent(records)
+
+        preview = scan_preview_for_prefix(records[0], children=children)
+
+        self.assertEqual("10.114.50.0/24", preview)
+
+    def test_scan_preview_for_standalone(self):
+        records = [_record(1, "10.200.0.0/24")]
+        children = children_by_parent(records)
+
+        preview = scan_preview_for_prefix(records[0], children=children)
+
+        self.assertEqual("(scans this prefix)", preview)
 
     def test_expand_nested_hierarchy_uses_leaf_prefixes(self):
         records = [

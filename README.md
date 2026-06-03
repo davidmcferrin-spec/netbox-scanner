@@ -121,7 +121,9 @@ The API token needs:
 
 ## Choosing what to scan
 
-By default, the CLI fetches **prefixes** from NetBox and prompts you to pick one or more. The list shows **parent prefixes** (site aggregates) and **standalone** prefixes without a parent in NetBox. Child prefixes under a listed parent are hidden; selecting the parent scans **leaf child prefix CIDRs** (for example `/24` subnets under a `/16`). If a parent has no children, the parent CIDR is scanned. Use `--prefix` with a child CIDR to drill into one subnet only.
+Each run prints a **Run Configuration** table (profile, speed, target mode, host count, write mode, and related settings) before scanning begins. When a host is **verified**, the CLI prints a **FIND** line with IP, PTR hostname, open ports, and whether it was added to NetBox (or why not).
+
+By default, the CLI fetches **prefixes** from NetBox and prompts you to pick one or more. The list shows **parent prefixes** (site aggregates) and **standalone** prefixes without a parent in NetBox. Child prefixes under a listed parent are hidden; selecting the parent scans **leaf child prefix CIDRs** (for example `/24` subnets under a `/16`). If a parent has no children, the parent CIDR is scanned. Use `--prefix` with a child CIDR to drill into one subnet only. Before you choose, answer **Show child prefixes?** to print which leaf CIDRs each parent row will scan.
 
 **Scan targets** are usable host addresses in those prefix CIDRs (not NetBox IP range records). **IP ranges** within the selected prefixes are used only to **exclude** addresses (reserved/excluded ranges, `skip_ranges`, and `skip_roles`).
 

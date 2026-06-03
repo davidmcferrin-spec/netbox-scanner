@@ -159,6 +159,7 @@ def children_by_parent(records: list[PrefixRecord]) -> dict[int, list[PrefixReco
 
 
 def prefixes_for_display(records: list[PrefixRecord]) -> list[PrefixRecord]:
+    """Parents and standalones for the picker: hide rows whose parent exists in NetBox."""
     index = build_prefix_index(records)
     display: list[PrefixRecord] = []
     for record in records:
@@ -166,6 +167,32 @@ def prefixes_for_display(records: list[PrefixRecord]) -> list[PrefixRecord]:
             continue
         display.append(record)
     return sorted(display, key=lambda item: (item.site or "", item.prefix))
+
+
+def prefix_has_children(
+    record: PrefixRecord,
+    children: dict[int, list[PrefixRecord]],
+) -> bool:
+    return record.id in children
+
+
+def leaf_child_prefixes_for_parent(
+    record_id: int,
+    *,
+    children: dict[int, list[PrefixRecord]],
+) -> list[str]:
+    return sorted(_leaf_descendant_prefixes(record_id, children=children))
+
+
+def scan_preview_for_prefix(
+    record: PrefixRecord,
+    *,
+    children: dict[int, list[PrefixRecord]],
+) -> str:
+    leaf_children = leaf_child_prefixes_for_parent(record.id, children=children)
+    if leaf_children:
+        return ", ".join(leaf_children)
+    return "(scans this prefix)"
 
 
 def _record_by_cidr(records: list[PrefixRecord], cidr: str) -> PrefixRecord | None:
@@ -199,9 +226,7 @@ def count_leaf_descendants(
     *,
     children: dict[int, list[PrefixRecord]],
 ) -> int:
-    if record.id not in children:
-        return 0
-    return len(_leaf_descendant_prefixes(record.id, children=children))
+    return len(leaf_child_prefixes_for_parent(record.id, children=children))
 
 
 def expand_prefixes_to_scan_cidrs(records: list[PrefixRecord], selected_cidrs: list[str]) -> list[str]:
