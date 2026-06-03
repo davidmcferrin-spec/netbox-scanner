@@ -1,93 +1,104 @@
 # netbox-scanner
-Project Prompt: netbox-scanner — NetBox-Integrated Subnet Scanner
-Build a Linux command-line tool in Python called netbox-scanner that integrates with a NetBox IPAM instance to perform subnet discovery, port scanning, and DNS verification, with confirmed results written back to NetBox as IP Address records.
 
-Core Requirements
-NetBox Integration
+`netbox-scanner` is a Python 3.10+ CLI for scanning NetBox IP ranges, double-verifying DNS, and optionally writing verified IP address records back to NetBox.
 
-Connect via pynetbox using a configurable base URL and API token (config file or env var)
-Pull prefixes to scan by one or more IP Range names passed as CLI args — collect all matches into a list (duplicates by name are expected and supported)
-Pull NetBox IP Ranges flagged as reserved/excluded and skip those IPs before any scan traffic is sent
-Write verified IP Address records to NetBox only — no device or interface association
-Writes gated by --confirm (interactive y/n per record) or --auto-confirm (batch approve all)
+## Features
 
-Scanning Engine
+- NetBox integration through `pynetbox` with config-file or environment-based credentials
+- Repeatable `--ranges` support, including duplicate names
+- Reserved/excluded NetBox IP ranges and local exclusion files applied before any scan traffic
+- ICMP ping first-pass liveness checks followed by `python-nmap` scans
+- Configurable named scan profiles and `--speed` to nmap timing template mapping
+- PTR + forward DNS verification before any NetBox write
+- `--confirm`, `--auto-confirm`, and `--dry-run` write controls
+- Rich CLI progress and summary output for ad hoc runs
+- Cron scheduling through APScheduler with file-based logging
+- JSON or CSV export of scan results
 
-ICMP ping first-pass liveness check before any nmap scan
-Port scanning via python-nmap
-Named scan profiles defined in config as arrays of ports or nmap flag strings:
+## Requirements
 
-e.g., default, full, web, media, stealth
+- Python 3.10+
+- Debian/Ubuntu Linux
+- `nmap` installed on the host:
 
+```bash
+sudo apt-get update
+sudo apt-get install -y nmap
+```
 
-Scan aggressiveness controlled by a --speed flag mapping to nmap timing templates:
+- Python packages:
 
-paranoid → -T0, sneaky → -T1, polite → -T2, normal → -T3 (default), aggressive → -T4, insane → -T5
+```bash
+python -m pip install pynetbox python-nmap dnspython click rich pyyaml APScheduler
+```
 
+## Configuration
 
---dry-run mode shows all planned NetBox writes without executing them
+The scanner reads configuration from the first file it finds:
 
-DNS Verification
+1. `~/.netbox-scanner.conf`
+2. `./config.yaml`
 
-Reverse DNS (PTR) lookup on each discovered IP
-Forward DNS confirmation on the returned hostname — must resolve back to same IP
-Record hostname only if both agree; flag as dns_mismatch otherwise
-All mismatches logged for review
+You can also override NetBox credentials with environment variables:
 
-CLI Interface
+- `NETBOX_SCANNER_BASE_URL`
+- `NETBOX_SCANNER_API_TOKEN`
 
-Built with click
-Arguments:
+Copy `config.example.yaml` and adjust values for your environment.
 
---ranges — one or more IP Range names (repeatable, supports duplicates)
---profile — scan profile name from config
---speed — scan aggressiveness (paranoid | sneaky | polite | normal | aggressive | insane), default normal
---dry-run
---exclude-file — optional local CIDR/IP exclusion list
---output — optional JSON or CSV export
---confirm / --auto-confirm
---schedule — cron expression to run on a schedule (uses schedule or APScheduler)
+## Required NetBox API permissions
 
+The API token only needs:
 
+- `ipam > ip-ranges`: read
+- `ipam > ip-addresses`: read + write
 
-Progress & UX (CLI/ad hoc mode)
+## Usage
 
-rich progress bar showing:
+```bash
+python -m netbox_scanner.cli \
+  --ranges "Branch A" \
+  --ranges "Branch A" \
+  --profile web \
+  --speed normal \
+  --dry-run
+```
 
-Current IP being scanned
-Hosts completed / total
-ETA based on rolling average scan time per host
-Live count of: discovered, skipped (excluded), DNS verified, mismatches
+Interactive confirmation per verified record:
 
+```bash
+python -m netbox_scanner.cli --ranges "Branch A" --confirm
+```
 
-Summary table printed at end of run (rich Table)
-Scheduled runs log to file only (no interactive UI)
+Batch approval:
 
+```bash
+python -m netbox_scanner.cli --ranges "Branch A" --auto-confirm
+```
 
-Non-Functional Requirements
+Exclude additional local addresses or CIDRs:
 
-Config file: ~/.netbox-scanner.conf or ./config.yaml — stores API creds, default profile, default speed, DNS servers
-Structured logging to file + stdout via Python logging
-Graceful handling of: NetBox API errors, unreachable hosts, DNS timeouts, nmap failures
-Rate limiting on both nmap and NetBox API calls
-All exclusions applied before any scan packet is sent
-Unit tests for: exclusion logic, DNS double-verification, NetBox API response parsing, range name deduplication, speed flag → nmap timing mapping
+```bash
+python -m netbox_scanner.cli --ranges "Branch A" --exclude-file ./exclude.txt
+```
 
+Export results:
 
-Tech Stack
+```bash
+python -m netbox_scanner.cli --ranges "Branch A" --output results.json
+python -m netbox_scanner.cli --ranges "Branch A" --output results.csv
+```
 
-Python 3.10+
-pynetbox, python-nmap, dnspython, click, rich, pyyaml, APScheduler
-nmap must be installed on the host system
-Debian/Ubuntu Linux target
+Schedule recurring runs with cron syntax:
 
+```bash
+python -m netbox_scanner.cli --ranges "Branch A" --schedule "0 * * * *"
+```
 
-Deliverables
+## Tests
 
-netbox_scanner/ package — cli.py, scanner.py, netbox.py, dns_verify.py, config.py, scheduler.py
-tests/ with unit tests for all core logic
-config.example.yaml with every option documented
-README.md — install, config, usage examples, required NetBox API permissions
+Run the unit tests with:
 
-
-That's a solid, self-contained spec. One last thing worth pinning down before you start: NetBox API token permissions — the tool only needs ipam > ip-addresses: read + write and ipam > ip-ranges: read. Worth calling that out explicitly in the README so it doesn't get handed an admin token in production.
+```bash
+python -m unittest discover -s tests -v
+```
