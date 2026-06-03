@@ -461,19 +461,17 @@ class NetBoxTests(unittest.TestCase):
         self.assertFalse(is_excluded("10.0.0.50", exclusions))
 
     def test_collect_exclusion_ranges_includes_reserved_by_name(self):
+        reserved = {
+            "id": 10,
+            "name": "reserved-block",
+            "start_address": "10.0.0.1",
+            "end_address": "10.0.0.2",
+            "status": {"value": "reserved"},
+        }
         api = FakeAPI(
             {},
-            parent_ranges={
-                "10.0.0.0/24": [
-                    {
-                        "id": 10,
-                        "name": "reserved-block",
-                        "start_address": "10.0.0.1",
-                        "end_address": "10.0.0.2",
-                        "status": {"value": "reserved"},
-                    },
-                ],
-            },
+            all_ranges=[reserved],
+            parent_ranges={"10.0.0.0/24": [reserved]},
         )
 
         exclusions = collect_exclusion_ranges_for_prefixes(

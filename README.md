@@ -91,7 +91,9 @@ With the default `services` profile, a host must have at least one of SSH (22), 
 
 The opt-in `full` profile (all ports) uses nmap host-up status instead of requiring a specific open port.
 
-Use `--speed polite` or `--speed sneaky` and increase `scan_rate_limit` in config to reduce scan aggressiveness.
+Use `--speed polite` or `--speed sneaky` and increase `scan_rate_limit` in config to reduce scan aggressiveness. Keep `netbox.rate_limit` at `0` for fast interactive setup; that delay only affects NetBox API calls during prefix selection and planning, not the host scan loop.
+
+During a run, prefixes and IP ranges are fetched once and cached on the client so setup does not repeat `prefixes.all()` or `ip_ranges.all()` before scanning.
 
 DNS (PTR, A, CNAME) is collected for reporting and as an optional `dns_name` hint when writing to NetBox. DNS never gates liveness or blocks writes.
 

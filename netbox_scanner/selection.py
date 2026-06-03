@@ -6,7 +6,7 @@ from rich.table import Table
 
 from .netbox import (
     PrefixRecord,
-    display_scan_target_count,
+    build_scan_target_counts,
     format_scan_target_label,
     range_exclusion_reason,
     range_matches_skip_role,
@@ -64,6 +64,7 @@ def prompt_prefix_selection(
         raise click.ClickException("No NetBox prefixes found.")
 
     all_records = all_prefixes or prefixes
+    target_counts = build_scan_target_counts(prefixes, all_records)
     output = console or Console()
     table = Table(title="NetBox Prefixes")
     table.add_column("#", justify="right")
@@ -72,8 +73,7 @@ def prompt_prefix_selection(
     table.add_column("Site")
     table.add_column("Scan targets", justify="right")
     for index, prefix in enumerate(prefixes, start=1):
-        target_count = display_scan_target_count(prefix, all_records)
-        target_label = format_scan_target_label(target_count)
+        target_label = format_scan_target_label(target_counts[prefix.id])
         table.add_row(
             str(index),
             prefix.prefix,

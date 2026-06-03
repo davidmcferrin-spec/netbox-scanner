@@ -496,6 +496,8 @@ def build_skip_role_match_keys(api, skip_roles: list[str]) -> set[str]:
 def build_skip_role_matchers(
     api,
     skip_roles: list[str],
+    *,
+    role_catalog: dict[int, tuple[str | None, str | None]] | None = None,
 ) -> tuple[set[str], set[int], dict[int, tuple[str | None, str | None]]]:
     """Normalized name/slug keys, matching role ids, and full role catalog."""
     keys: set[str] = set()
@@ -510,7 +512,7 @@ def build_skip_role_matchers(
         keys.add(normalized)
         config_norm.add(normalized)
 
-    catalog = build_role_catalog(api)
+    catalog = role_catalog if role_catalog is not None else build_role_catalog(api)
     for role_id, (name, slug) in catalog.items():
         name_norm = _normalize_role_token(name) if name else None
         slug_norm = _normalize_role_token(slug) if slug else None
@@ -600,9 +602,23 @@ def collect_ranges_by_name(api, names: list[str]) -> list[RangeRecord]:
     return ranges
 
 
-def collect_ranges_within_prefixes(api, prefix_cidrs: list[str]) -> list[RangeRecord]:
+def collect_ranges_within_prefixes(
+    api,
+    prefix_cidrs: list[str],
+    *,
+    ip_range_records: list[Any] | None = None,
+) -> list[RangeRecord]:
     ranges: list[RangeRecord] = []
     seen_ids: set[int] = set()
+
+    if ip_range_records is not None:
+        for cidr in prefix_cidrs:
+            for record in ip_range_records:
+                if not range_contained_in_prefix(record, cidr):
+                    continue
+                parsed = parse_range_record(record, prefix=cidr)
+                _append_unique_range(ranges, seen_ids, parsed)
+        return ranges
 
     for cidr in prefix_cidrs:
         candidates: list[Any] = []
@@ -668,12 +684,19 @@ def collect_ranges_by_skip_roles_for_prefixes(
     api,
     prefix_cidrs: list[str],
     skip_roles: list[str],
+    *,
+    ip_range_records: list[Any] | None = None,
+    role_catalog: dict[int, tuple[str | None, str | None]] | None = None,
 ) -> list[RangeRecord]:
     """IP ranges whose assigned role matches skip_roles and overlaps a prefix in scope."""
     if not skip_roles or not prefix_cidrs:
         return []
 
-    match_keys, match_role_ids, role_catalog = build_skip_role_matchers(api, skip_roles)
+    if role_catalog is None:
+        role_catalog = build_role_catalog(api)
+    match_keys, match_role_ids, role_catalog = build_skip_role_matchers(
+        api, skip_roles, role_catalog=role_catalog
+    )
     if not match_keys and not match_role_ids:
         return []
 
@@ -681,7 +704,11 @@ def collect_ranges_by_skip_roles_for_prefixes(
     seen_ids: set[int] = set()
 
     try:
-        all_records = list(api.ipam.ip_ranges.all())
+        all_records = (
+            ip_range_records
+            if ip_range_records is not None
+            else list(api.ipam.ip_ranges.all())
+        )
     except Exception as exc:
         LOGGER.debug("Failed to fetch all ip_ranges for skip_roles: %s", exc)
         return []
@@ -818,21 +845,95 @@ def collect_exclusion_ranges_for_prefixes(
     skip_roles: list[str],
     *,
     selected_prefix_cidrs: list[str] | None = None,
+    ip_range_records: list[Any] | None = None,
+    role_catalog: dict[int, tuple[str | None, str | None]] | None = None,
 ) -> list[RangeRecord]:
-    """IP range spans to exclude from prefix host scans (not whole prefixes)."""
+    """IP range spans to exclude from prefix host scans (not whole prefixes).
+
+    Uses one ip_ranges payload when ip_range_records is omitted or supplied by the client cache.
+    """
     skip_name_set = set(skip_names)
     exclusions: list[RangeRecord] = []
     seen_ids: set[int] = set()
     scope_cidrs = union_prefix_cidrs(selected_prefix_cidrs, scan_prefix_cidrs)
+    if not scope_cidrs:
+        return []
 
-    for record in collect_ranges_within_prefixes(api, scope_cidrs):
-        if record.excluded or record.name in skip_name_set:
-            _append_unique_range(exclusions, seen_ids, record)
+    if role_catalog is None:
+        role_catalog = build_role_catalog(api)
 
-    for record in collect_ranges_by_skip_roles_for_prefixes(api, scope_cidrs, skip_roles):
-        _append_unique_range(exclusions, seen_ids, record)
+    match_keys: set[str] | None = None
+    match_role_ids: set[int] | None = None
+    if skip_roles:
+        match_keys, match_role_ids, _ = build_skip_role_matchers(
+            api, skip_roles, role_catalog=role_catalog
+        )
+
+    try:
+        all_records = (
+            ip_range_records
+            if ip_range_records is not None
+            else list(api.ipam.ip_ranges.all())
+        )
+    except Exception as exc:
+        LOGGER.debug("Failed to fetch ip_ranges for exclusions: %s", exc)
+        return []
+
+    matched_roles = 0
+    matched_overlap = 0
+    for raw in all_records:
+        overlap_prefix = _best_overlap_prefix(raw, scope_cidrs)
+        if overlap_prefix is None:
+            continue
+
+        parsed = parse_range_record(
+            raw,
+            prefix=overlap_prefix,
+            role_catalog=role_catalog,
+        )
+
+        include = False
+        if parsed.excluded or parsed.name in skip_name_set:
+            include = True
+        elif skip_roles and range_matches_skip_role(
+            parsed,
+            skip_roles,
+            match_keys=match_keys,
+            role_ids=match_role_ids,
+        ):
+            matched_roles += 1
+            matched_overlap += 1
+            include = True
+
+        if include:
+            _append_unique_range(exclusions, seen_ids, parsed)
+
+    if skip_roles:
+        if matched_roles and not exclusions:
+            LOGGER.warning(
+                "Found %s IP range(s) with skip role(s) %s but none overlap scan prefixes: %s",
+                matched_roles,
+                skip_roles,
+                ", ".join(scope_cidrs[:5]),
+            )
+        elif not matched_roles:
+            LOGGER.warning(
+                "No IP ranges matched skip_roles %s (check role names in config vs /api/ipam/roles/)",
+                skip_roles,
+            )
 
     return exclusions
+
+
+def build_scan_target_counts(
+    display_prefixes: list[PrefixRecord],
+    all_records: list[PrefixRecord],
+) -> dict[int, int]:
+    """Precompute picker scan-target counts (one pass per displayed prefix)."""
+    return {
+        prefix.id: display_scan_target_count(prefix, all_records)
+        for prefix in display_prefixes
+    }
 
 
 def iter_prefix_hosts(cidr: str):
@@ -920,6 +1021,9 @@ class NetBoxClient:
         self.timeout = timeout
         self.rate_limit = rate_limit
         self._api = api
+        self._prefix_cache: list[PrefixRecord] | None = None
+        self._ip_range_raw_cache: list[Any] | None = None
+        self._role_catalog_cache: dict[int, tuple[str | None, str | None]] | None = None
 
     @property
     def api(self):
@@ -986,16 +1090,38 @@ class NetBoxClient:
                 f"NetBox status check failed for {self.base_url} (HTTP {response.status_code})."
             ) from exc
 
+    def _role_catalog(self) -> dict[int, tuple[str | None, str | None]]:
+        if self._role_catalog_cache is None:
+            self._sleep()
+            self._role_catalog_cache = build_role_catalog(self.api)
+        return self._role_catalog_cache
+
+    def _ip_range_raw(self) -> list[Any]:
+        if self._ip_range_raw_cache is None:
+            self._sleep()
+            try:
+                self._ip_range_raw_cache = list(self.api.ipam.ip_ranges.all())
+            except Exception as exc:
+                self._handle_request_error(exc)
+        return self._ip_range_raw_cache
+
     def fetch_prefixes(self) -> list[PrefixRecord]:
+        if self._prefix_cache is not None:
+            return self._prefix_cache
         self._sleep()
         try:
-            return fetch_prefixes(self.api)
+            self._prefix_cache = fetch_prefixes(self.api)
         except Exception as exc:
             self._handle_request_error(exc)
+        return self._prefix_cache
 
     def fetch_ranges_within_prefixes(self, prefix_cidrs: list[str]) -> list[RangeRecord]:
         self._sleep()
-        return collect_ranges_within_prefixes(self.api, prefix_cidrs)
+        return collect_ranges_within_prefixes(
+            self.api,
+            prefix_cidrs,
+            ip_range_records=self._ip_range_raw_cache,
+        )
 
     def fetch_exclusion_ranges_for_prefixes(
         self,
@@ -1005,13 +1131,16 @@ class NetBoxClient:
         *,
         selected_prefix_cidrs: list[str] | None = None,
     ) -> list[RangeRecord]:
-        self._sleep()
+        if self._ip_range_raw_cache is None:
+            self._sleep()
         return collect_exclusion_ranges_for_prefixes(
             self.api,
             scan_prefix_cidrs,
             skip_names,
             skip_roles,
             selected_prefix_cidrs=selected_prefix_cidrs,
+            ip_range_records=self._ip_range_raw(),
+            role_catalog=self._role_catalog(),
         )
 
     def fetch_scan_ranges(self, names: list[str]) -> list[RangeRecord]:
@@ -1019,9 +1148,12 @@ class NetBoxClient:
         return collect_ranges_by_name(self.api, names)
 
     def fetch_excluded_ranges(self) -> list[RangeRecord]:
-        self._sleep()
-        records = self.api.ipam.ip_ranges.all()
-        return [parse_range_record(record) for record in records if range_is_excluded(record)]
+        role_catalog = self._role_catalog()
+        return [
+            parse_range_record(record, role_catalog=role_catalog)
+            for record in self._ip_range_raw()
+            if range_is_excluded(record)
+        ]
 
     def evaluate_ip_address(self, ip: str, hostname: str | None = None) -> IpAddressWriteResult:
         payload = build_ip_address_payload(ip, hostname)

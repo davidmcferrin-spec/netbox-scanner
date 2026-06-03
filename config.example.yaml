@@ -19,9 +19,9 @@ netbox:
 
   timeout: 30
 
-  # Delay in seconds between NetBox API calls.
+  # Delay in seconds between NetBox API calls (setup/plan only; use 0 for fast interactive setup).
 
-  rate_limit: 0.1
+  rate_limit: 0
 
 
 

@@ -14,6 +14,7 @@ from rich.table import Table
 from .config import AppConfig, _select_config_path, configure_logging, load_config, validate_config
 from .netbox import (
     NetBoxClient,
+    PrefixRecord,
     RangeRecord,
     netbox_authorization_scheme,
     apply_skip_ranges,
@@ -481,6 +482,7 @@ def _resolve_scan_targets(
             skip_name_set=skip_name_set,
         )
 
+    all_prefixes: list[PrefixRecord] | None = None
     selected_prefixes: list[str]
     if prefixes:
         selected_prefixes = list(prefixes)
@@ -501,7 +503,8 @@ def _resolve_scan_targets(
             console=console,
         )
 
-    all_prefixes = client.fetch_prefixes()
+    if all_prefixes is None:
+        all_prefixes = client.fetch_prefixes()
 
     scan_prefixes = expand_prefixes_to_scan_cidrs(all_prefixes, selected_prefixes)
     if not scan_prefixes:
