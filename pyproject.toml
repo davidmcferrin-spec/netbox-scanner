@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netbox-scanner"
+version = "0.2.0"
+description = "Scan NetBox IP ranges, verify DNS, and optionally write IP address records back to NetBox."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pynetbox>=7.0.0,<8",
+    "python-nmap>=0.7.1,<1",
+    "dnspython>=2.4.0,<3",
+    "click>=8.1.0,<9",
+    "rich>=13.0.0,<14",
+    "pyyaml>=6.0,<7",
+    "APScheduler>=3.10.0,<4",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+netbox-scanner = "netbox_scanner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["netbox_scanner*"]

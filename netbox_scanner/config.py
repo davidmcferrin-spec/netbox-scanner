@@ -41,17 +41,19 @@ class LoggingConfig:
 
 @dataclass(slots=True)
 class ScannerConfig:
-    default_profile: str = "default"
-    default_speed: str = "normal"
-    scan_rate_limit: float = 0.0
+    default_profile: str = "services"
+    default_speed: str = "polite"
+    scan_rate_limit: float = 0.5
     ping_timeout: float = 1.0
+    prefixes: list[str] = field(default_factory=list)
+    skip_ranges: list[str] = field(default_factory=list)
     profiles: dict[str, list[str]] = field(
         default_factory=lambda: {
-            "default": ["1-1024"],
-            "full": ["1-65535"],
+            "services": ["-sS", "-sU", "T:22,23,80,443,445,U:161"],
             "web": ["80", "443", "8080", "8443"],
             "media": ["554", "8554", "1935"],
-            "stealth": ["-sS", "-Pn"],
+            "full": ["1-65535"],
+            "stealth": ["-sS", "T:22,23,80,443,445,U:161"],
         }
     )
 
@@ -118,10 +120,12 @@ def load_config(path: str | None = None) -> AppConfig:
             file=str(logging_cfg.get("file", "netbox-scanner.log")),
         ),
         scanner=ScannerConfig(
-            default_profile=str(scanner.get("default_profile", "default")),
-            default_speed=str(scanner.get("default_speed", "normal")),
-            scan_rate_limit=float(scanner.get("scan_rate_limit", 0.0)),
-            ping_timeout=float(scanner.get("ping_timeout", 1.0)),
+            default_profile=str(scanner.get("default_profile", ScannerConfig().default_profile)),
+            default_speed=str(scanner.get("default_speed", ScannerConfig().default_speed)),
+            scan_rate_limit=float(scanner.get("scan_rate_limit", ScannerConfig().scan_rate_limit)),
+            ping_timeout=float(scanner.get("ping_timeout", ScannerConfig().ping_timeout)),
+            prefixes=[str(item) for item in scanner.get("prefixes", [])],
+            skip_ranges=[str(item) for item in scanner.get("skip_ranges", [])],
             profiles={
                 key: [str(item) for item in value]
                 for key, value in scanner.get("profiles", ScannerConfig().profiles).items()
@@ -129,6 +133,17 @@ def load_config(path: str | None = None) -> AppConfig:
         ),
     )
     return config
+
+
+def validate_config(config: AppConfig) -> None:
+    if not config.netbox.base_url.strip():
+        raise ValueError(
+            "NetBox base_url is required. Set netbox.base_url in config or NETBOX_SCANNER_BASE_URL."
+        )
+    if not config.netbox.api_token.strip():
+        raise ValueError(
+            "NetBox api_token is required. Set netbox.api_token in config or NETBOX_SCANNER_API_TOKEN."
+        )
 
 
 def configure_logging(config: LoggingConfig) -> None:

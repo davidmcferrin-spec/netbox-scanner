@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(slots=True)
-class DNSVerificationResult:
+class DNSLookupResult:
     ip: str
-    hostname: str | None
-    verified: bool
-    dns_mismatch: bool
+    ptr_hostname: str | None
+    forward_has_a_or_cname: bool = False
+    forward_addresses: list[str] = field(default_factory=list)
     reason: str = ""
 
 
@@ -29,57 +29,55 @@ def _build_resolver(resolver=None, nameservers: list[str] | None = None, timeout
     return built
 
 
-def verify_dns(
+def _resolve_addresses(resolver, hostname: str, record_type: str) -> list[str]:
+    try:
+        answers = resolver.resolve(hostname, record_type)
+    except Exception:
+        return []
+    if record_type == "CNAME":
+        return [str(answer).rstrip(".") for answer in answers]
+    return [str(ipaddress.ip_address(str(answer))) for answer in answers]
+
+
+def lookup_dns(
     ip: str,
     resolver=None,
     nameservers: list[str] | None = None,
     timeout: float = 2.0,
-) -> DNSVerificationResult:
+) -> DNSLookupResult:
     resolver = _build_resolver(resolver=resolver, nameservers=nameservers, timeout=timeout)
     try:
         normalized_ip = ipaddress.ip_address(ip)
     except ValueError:
-        return DNSVerificationResult(ip=ip, hostname=None, verified=False, dns_mismatch=True, reason="invalid_ip")
+        return DNSLookupResult(ip=ip, ptr_hostname=None, reason="invalid_ip")
 
+    ip_str = str(normalized_ip)
     try:
         ptr_query = normalized_ip.reverse_pointer
         ptr_answers = resolver.resolve(ptr_query, "PTR")
-        hostname = str(next(iter(ptr_answers))).rstrip(".")
+        ptr_hostname = str(next(iter(ptr_answers))).rstrip(".")
     except Exception:
-        return DNSVerificationResult(
-            ip=str(normalized_ip),
-            hostname=None,
-            verified=False,
-            dns_mismatch=True,
-            reason="reverse_lookup_failed",
-        )
+        return DNSLookupResult(ip=ip_str, ptr_hostname=None, reason="ptr_missing")
 
     record_type = "AAAA" if normalized_ip.version == 6 else "A"
-    try:
-        forward_answers = resolver.resolve(hostname, record_type)
-    except Exception:
-        return DNSVerificationResult(
-            ip=str(normalized_ip),
-            hostname=hostname,
-            verified=False,
-            dns_mismatch=True,
-            reason="forward_lookup_failed",
+    forward_addresses = _resolve_addresses(resolver, ptr_hostname, record_type)
+    cname_targets = _resolve_addresses(resolver, ptr_hostname, "CNAME")
+    forward_has_a_or_cname = bool(forward_addresses or cname_targets)
+    all_addresses = sorted(set(forward_addresses + cname_targets))
+
+    if forward_has_a_or_cname:
+        return DNSLookupResult(
+            ip=ip_str,
+            ptr_hostname=ptr_hostname,
+            forward_has_a_or_cname=True,
+            forward_addresses=all_addresses,
+            reason="lookup_ok",
         )
 
-    resolved = {str(ipaddress.ip_address(str(answer))) for answer in forward_answers}
-    if str(normalized_ip) in resolved:
-        return DNSVerificationResult(
-            ip=str(normalized_ip),
-            hostname=hostname,
-            verified=True,
-            dns_mismatch=False,
-            reason="verified",
-        )
-
-    return DNSVerificationResult(
-        ip=str(normalized_ip),
-        hostname=hostname,
-        verified=False,
-        dns_mismatch=True,
-        reason="forward_mismatch",
+    return DNSLookupResult(
+        ip=ip_str,
+        ptr_hostname=ptr_hostname,
+        forward_has_a_or_cname=False,
+        forward_addresses=[],
+        reason="forward_missing",
     )

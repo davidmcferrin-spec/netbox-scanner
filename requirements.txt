@@ -1,0 +1,7 @@
+pynetbox>=7.0.0,<8
+python-nmap>=0.7.1,<1
+dnspython>=2.4.0,<3
+click>=8.1.0,<9
+rich>=13.0.0,<14
+pyyaml>=6.0,<7
+APScheduler>=3.10.0,<4

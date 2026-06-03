@@ -1,2 +1,12 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+config.yaml
+.netbox-scanner.conf
+netbox-scanner.log
+*.log

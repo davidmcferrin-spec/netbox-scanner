@@ -1,0 +1,39 @@
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from netbox_scanner.config import AppConfig, NetBoxConfig, load_config, validate_config
+
+
+class ConfigTests(unittest.TestCase):
+    def test_validate_config_requires_netbox_credentials(self):
+        with self.assertRaisesRegex(ValueError, "base_url is required"):
+            validate_config(AppConfig(netbox=NetBoxConfig(base_url="", api_token="token")))
+
+        with self.assertRaisesRegex(ValueError, "api_token is required"):
+            validate_config(AppConfig(netbox=NetBoxConfig(base_url="https://netbox.example.com", api_token="")))
+
+    def test_load_config_applies_env_overrides(self):
+        yaml_text = """
+netbox:
+  base_url: "https://file.example.com"
+  api_token: "file-token"
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.yaml"
+            config_path.write_text(yaml_text, encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "NETBOX_SCANNER_BASE_URL": "https://env.example.com",
+                    "NETBOX_SCANNER_API_TOKEN": "env-token",
+                },
+                clear=False,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertEqual("https://env.example.com", config.netbox.base_url)
+        self.assertEqual("env-token", config.netbox.api_token)

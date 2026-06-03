@@ -1,51 +1,124 @@
 netbox:
+
   # NetBox API base URL.
+
   base_url: "https://netbox.example.com"
+
   # NetBox API token with read access to IP ranges and write access to IP addresses.
+
   api_token: "replace-me"
+
   # HTTP timeout in seconds.
+
   timeout: 30
+
   # Delay in seconds between NetBox API calls.
+
   rate_limit: 0.1
 
+
+
 dns:
+
   # Optional custom recursive resolvers for PTR/A lookups.
+
   servers:
+
     - "1.1.1.1"
+
     - "8.8.8.8"
+
   # DNS lookup timeout in seconds.
+
   timeout: 2
 
+
+
 logging:
+
   # Python log level.
+
   level: "INFO"
+
   # Log file for stdout/file dual logging and scheduled runs.
+
   file: "netbox-scanner.log"
 
+
+
 scanner:
-  # Default scan profile used when --profile is omitted.
-  default_profile: "default"
-  # Default speed used when --speed is omitted.
-  default_speed: "normal"
-  # Delay in seconds between nmap scans.
-  scan_rate_limit: 0.1
-  # ICMP ping timeout in seconds.
+
+  # Default scan profile: services probes SSH, Telnet, HTTP/S, SMB, and SNMP only.
+
+  default_profile: "services"
+
+  # Default nmap timing (-T2 polite). Use sneaky or paranoid to reduce scan visibility.
+
+  default_speed: "polite"
+
+  # Delay in seconds between nmap scans per host.
+
+  scan_rate_limit: 0.5
+
+  # ICMP ping timeout in seconds. ICMP ping always runs before nmap on every IP.
+
   ping_timeout: 1
+
+  # Unattended/scheduled runs: prefix CIDRs to scan (all contained IP ranges included).
+
+  prefixes: []
+
+  # IP range names to never scan (exact name match).
+
+  skip_ranges:
+
+    - "reserved-loopbacks"
+
+    - "mgmt-excluded"
+
   # Named scan profiles. Values can be port lists/ranges or raw nmap flags.
+
   profiles:
-    default:
-      - "1-1024"
-    full:
-      - "1-65535"
-    web:
-      - "80"
-      - "443"
-      - "8080"
-      - "8443"
-    media:
-      - "554"
-      - "8554"
-      - "1935"
-    stealth:
+
+    # TCP 22, 23, 80, 443, 445 and UDP 161 (SNMP). Requires root/cap_net_raw for -sS/-sU.
+
+    services:
+
       - "-sS"
-      - "-Pn"
+
+      - "-sU"
+
+      - "T:22,23,80,443,445,U:161"
+
+    web:
+
+      - "80"
+
+      - "443"
+
+      - "8080"
+
+      - "8443"
+
+    media:
+
+      - "554"
+
+      - "8554"
+
+      - "1935"
+
+    # Opt-in exhaustive scan only. Not used by default.
+
+    full:
+
+      - "1-65535"
+
+    # SYN scan of the same service ports without UDP.
+
+    stealth:
+
+      - "-sS"
+
+      - "T:22,23,80,443,445,8080,8443,544,1935,U:161"
+
