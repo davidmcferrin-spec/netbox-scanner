@@ -6,13 +6,16 @@ from netbox_scanner.netbox import (
     IpAddressWriteResult,
     NetBoxClient,
     apply_skip_ranges,
+    apply_skip_roles,
     collect_ranges_by_name,
     collect_ranges_within_prefixes,
     iter_unique_targets,
     normalize_hostname,
     parse_range_record,
+    parse_role,
     range_contained_in_prefix,
     range_is_excluded,
+    range_matches_skip_role,
     record_dns_name,
 )
 from netbox_scanner.netbox import RangeRecord
@@ -124,6 +127,63 @@ class NetBoxTests(unittest.TestCase):
         ]
         filtered = apply_skip_ranges(records, ["skip-me"])
         self.assertEqual(["keep"], [record.name for record in filtered])
+
+    def test_parse_role_extracts_name_and_slug(self):
+        self.assertEqual(
+            ("DHCP Pool", "dhcp-pool"),
+            parse_role({"name": "DHCP Pool", "slug": "dhcp-pool"}),
+        )
+        self.assertEqual(("VIP", None), parse_role({"value": "VIP"}))
+
+    def test_parse_range_record_extracts_role(self):
+        record = parse_range_record(
+            {
+                "name": "pool",
+                "start_address": "10.0.0.1",
+                "end_address": "10.0.0.10",
+                "role": {"name": "DHCP Pool", "slug": "dhcp-pool"},
+            }
+        )
+        self.assertEqual("DHCP Pool", record.role_name)
+        self.assertEqual("dhcp-pool", record.role_slug)
+
+    def test_apply_skip_roles_skips_matching_roles(self):
+        records = [
+            RangeRecord(name="static", start_address="10.0.0.1", end_address="10.0.0.1"),
+            RangeRecord(
+                name="dhcp",
+                start_address="10.0.0.2",
+                end_address="10.0.0.2",
+                role_name="DHCP Pool",
+                role_slug="dhcp-pool",
+            ),
+            RangeRecord(
+                name="slug-only",
+                start_address="10.0.0.3",
+                end_address="10.0.0.3",
+                role_slug="dhcp-pool",
+            ),
+        ]
+        filtered = apply_skip_roles(records, ["DHCP Pool"])
+        self.assertEqual(["static", "slug-only"], [record.name for record in filtered])
+        filtered_by_slug = apply_skip_roles(records, ["dhcp-pool"])
+        self.assertEqual(["static"], [record.name for record in filtered_by_slug])
+
+    def test_apply_skip_roles_is_case_insensitive(self):
+        records = [
+            RangeRecord(
+                name="dhcp",
+                start_address="10.0.0.1",
+                end_address="10.0.0.1",
+                role_name="dhcp pool",
+            )
+        ]
+        self.assertTrue(range_matches_skip_role(records[0], ["DHCP Pool"]))
+        self.assertEqual([], apply_skip_roles(records, ["dhcp pool"]))
+
+    def test_apply_skip_roles_keeps_ranges_without_role(self):
+        records = [RangeRecord(name="lab", start_address="10.0.0.1", end_address="10.0.0.1")]
+        self.assertEqual(records, apply_skip_roles(records, ["DHCP Pool"]))
 
     def test_collect_ranges_within_prefixes_includes_duplicate_names(self):
         api = FakeAPI(

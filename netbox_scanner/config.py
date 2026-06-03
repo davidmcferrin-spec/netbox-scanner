@@ -47,6 +47,7 @@ class ScannerConfig:
     ping_timeout: float = 1.0
     prefixes: list[str] = field(default_factory=list)
     skip_ranges: list[str] = field(default_factory=list)
+    skip_roles: list[str] = field(default_factory=lambda: ["DHCP Pool"])
     profiles: dict[str, list[str]] = field(
         default_factory=lambda: {
             "services": ["-sS", "-sU", "T:22,23,80,443,445,U:161"],
@@ -126,6 +127,11 @@ def load_config(path: str | None = None) -> AppConfig:
             ping_timeout=float(scanner.get("ping_timeout", ScannerConfig().ping_timeout)),
             prefixes=[str(item) for item in scanner.get("prefixes", [])],
             skip_ranges=[str(item) for item in scanner.get("skip_ranges", [])],
+            skip_roles=(
+                [str(item) for item in scanner["skip_roles"]]
+                if "skip_roles" in scanner
+                else list(ScannerConfig().skip_roles)
+            ),
             profiles={
                 key: [str(item) for item in value]
                 for key, value in scanner.get("profiles", ScannerConfig().profiles).items()

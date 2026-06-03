@@ -37,3 +37,21 @@ netbox:
 
         self.assertEqual("https://env.example.com", config.netbox.base_url)
         self.assertEqual("env-token", config.netbox.api_token)
+
+    def test_load_config_default_skip_roles(self):
+        config = load_config("/nonexistent/config.yaml")
+        self.assertEqual(["DHCP Pool"], config.scanner.skip_roles)
+
+    def test_load_config_empty_skip_roles_disables_filter(self):
+        yaml_text = """
+netbox:
+  base_url: "https://file.example.com"
+  api_token: "file-token"
+scanner:
+  skip_roles: []
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.yaml"
+            config_path.write_text(yaml_text, encoding="utf-8")
+            config = load_config(str(config_path))
+        self.assertEqual([], config.scanner.skip_roles)

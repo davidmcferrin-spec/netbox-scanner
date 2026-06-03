@@ -7,6 +7,7 @@
 - NetBox integration through `pynetbox` with config-file or environment-based credentials
 - Prefix-driven scan selection with interactive multi-select (or config/CLI CIDRs)
 - Skip list for IP range names via config `skip_ranges` or `--skip-range`
+- Skip entire IP ranges by NetBox Role via config `skip_roles` (default: `DHCP Pool`) or `--skip-role`
 - Deduplicated scan targets across overlapping ranges
 - Reserved/excluded NetBox IP ranges and local exclusion files applied before any scan traffic
 - Two-step liveness verification: ICMP ping (always) plus nmap confirmation on limited service ports
@@ -46,17 +47,38 @@ python -m pip install -e .
 
 ## Configuration
 
-The scanner reads configuration from the first file it finds:
+Configuration is YAML. Both default locations use the same format as [`config.example.yaml`](config.example.yaml). Only **one** file is loaded — they are not merged.
 
-1. `~/.netbox-scanner.conf`
-2. `./config.yaml`
+### Resolution order
 
-You can also override NetBox credentials with environment variables:
+1. `--config /path/to/file.yaml` if passed on the CLI
+2. Otherwise `~/.netbox-scanner.conf` if it exists
+3. Otherwise `./config.yaml` in the current working directory if it exists
+4. Otherwise no file (NetBox credentials can still come from environment variables)
+
+### When to use which
+
+| Location | Typical use |
+|----------|-------------|
+| `~/.netbox-scanner.conf` | Personal token and defaults on a shared or multi-project host; works from any directory |
+| `./config.yaml` | Per-checkout or per-deployment settings when you always run from the project directory |
+
+If **both** default files exist, `~/.netbox-scanner.conf` wins and `./config.yaml` is ignored.
+
+### Setup
+
+```bash
+cp config.example.yaml ~/.netbox-scanner.conf   # user-wide
+# or
+cp config.example.yaml config.yaml              # project directory
+```
+
+Edit the copy and set `netbox.base_url` and `netbox.api_token` (both required).
+
+Environment variables override values from whichever file is loaded:
 
 - `NETBOX_SCANNER_BASE_URL`
 - `NETBOX_SCANNER_API_TOKEN`
-
-Copy `config.example.yaml` and adjust values for your environment. `base_url` and `api_token` are required.
 
 ## Liveness verification
 
@@ -112,6 +134,20 @@ scanner:
 
 ```bash
 python -m netbox_scanner.cli --skip-range "reserved-loopbacks" --dry-run
+```
+
+Skip entire IP ranges by NetBox **Role** (not individual IPs within a range). By default, ranges with role `"DHCP Pool"` are excluded from the scan pool. This is separate from `skip_ranges` (by name) and from reserved/excluded ranges whose IPs are subtracted from targets inside other ranges.
+
+```yaml
+scanner:
+  skip_roles:
+    - "DHCP Pool"
+```
+
+Set `skip_roles: []` in config to disable role-based skipping. Use `--skip-role` to add roles on the CLI (config defaults still apply unless cleared in config):
+
+```bash
+python -m netbox_scanner.cli --skip-role "VIP Pool" --dry-run
 ```
 
 For scheduled/unattended runs, set prefixes in config:

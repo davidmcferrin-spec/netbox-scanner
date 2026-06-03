@@ -10,7 +10,7 @@ from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
 from .config import AppConfig, configure_logging, load_config, validate_config
-from .netbox import NetBoxClient, apply_skip_ranges
+from .netbox import NetBoxClient, apply_skip_ranges, apply_skip_roles
 from .scanner import NetworkScanner, export_results
 from .scheduler import run_on_schedule
 from .selection import prompt_prefix_selection, render_range_plan
@@ -108,6 +108,14 @@ def _merge_skip_ranges(config: AppConfig, skip_range_flags: tuple[str, ...]) -> 
     return merged
 
 
+def _merge_skip_roles(config: AppConfig, skip_role_flags: tuple[str, ...]) -> list[str]:
+    merged: list[str] = []
+    for role in [*config.scanner.skip_roles, *skip_role_flags]:
+        if role and role not in merged:
+            merged.append(role)
+    return merged
+
+
 def _resolve_scan_targets(
     client: NetBoxClient,
     config: AppConfig,
@@ -115,18 +123,27 @@ def _resolve_scan_targets(
     ranges: tuple[str, ...],
     prefixes: tuple[str, ...],
     skip_ranges: list[str],
+    skip_roles: list[str],
     interactive: bool,
     scheduled: bool,
 ):
-    skip_set = set(skip_ranges)
+    skip_name_set = set(skip_ranges)
 
     if ranges:
         all_ranges = client.fetch_scan_ranges(list(ranges))
         scan_ranges = apply_skip_ranges(all_ranges, skip_ranges)
+        scan_ranges = apply_skip_roles(scan_ranges, skip_roles)
         if not scan_ranges:
-            raise click.ClickException("All IP ranges were skipped by skip_ranges configuration.")
+            raise click.ClickException(
+                "All IP ranges were skipped by skip_ranges or skip_roles configuration."
+            )
         if interactive:
-            render_range_plan(all_ranges, skipped_names=skip_set, console=console)
+            render_range_plan(
+                all_ranges,
+                skipped_names=skip_name_set,
+                skip_roles=skip_roles,
+                console=console,
+            )
         return None, scan_ranges
 
     selected_prefixes: list[str]
@@ -148,11 +165,19 @@ def _resolve_scan_targets(
         raise click.ClickException(f"No IP ranges found within prefixes: {prefix_list}")
 
     scan_ranges = apply_skip_ranges(all_ranges, skip_ranges)
+    scan_ranges = apply_skip_roles(scan_ranges, skip_roles)
     if not scan_ranges:
-        raise click.ClickException("All IP ranges were skipped by skip_ranges configuration.")
+        raise click.ClickException(
+            "All IP ranges were skipped by skip_ranges or skip_roles configuration."
+        )
 
     if interactive:
-        render_range_plan(all_ranges, skipped_names=skip_set, console=console)
+        render_range_plan(
+            all_ranges,
+            skipped_names=skip_name_set,
+            skip_roles=skip_roles,
+            console=console,
+        )
 
     return selected_prefixes, scan_ranges
 
@@ -163,6 +188,7 @@ def _run_scan(
     ranges: tuple[str, ...],
     prefixes: tuple[str, ...],
     skip_range_flags: tuple[str, ...],
+    skip_role_flags: tuple[str, ...],
     profile: str | None,
     speed: str | None,
     dry_run: bool,
@@ -180,6 +206,7 @@ def _run_scan(
     chosen_profile = profile or config.scanner.default_profile
     chosen_speed = speed or config.scanner.default_speed
     skip_ranges = _merge_skip_ranges(config, skip_range_flags)
+    skip_roles = _merge_skip_roles(config, skip_role_flags)
 
     client = NetBoxClient(
         config.netbox.base_url,
@@ -195,6 +222,7 @@ def _run_scan(
         ranges=ranges,
         prefixes=prefixes,
         skip_ranges=skip_ranges,
+        skip_roles=skip_roles,
         interactive=interactive,
         scheduled=scheduled,
     )
@@ -274,6 +302,7 @@ def _run_scan(
 @click.option("--ranges", "ranges", multiple=True, help="Legacy: NetBox IP Range name. Repeatable.")
 @click.option("--prefix", "prefixes", multiple=True, help="Prefix CIDR to scan. Repeatable.")
 @click.option("--skip-range", "skip_range_flags", multiple=True, help="IP range name to skip. Repeatable.")
+@click.option("--skip-role", "skip_role_flags", multiple=True, help="IP range role to skip. Repeatable.")
 @click.option("--profile", type=str, help="Configured scan profile name.")
 @click.option(
     "--speed",
@@ -293,6 +322,7 @@ def main(
     ranges: tuple[str, ...],
     prefixes: tuple[str, ...],
     skip_range_flags: tuple[str, ...],
+    skip_role_flags: tuple[str, ...],
     profile: str | None,
     speed: str | None,
     dry_run: bool,
@@ -322,6 +352,7 @@ def main(
         ranges=ranges,
         prefixes=prefixes,
         skip_range_flags=skip_range_flags,
+        skip_role_flags=skip_role_flags,
         profile=profile,
         speed=speed,
         dry_run=dry_run,

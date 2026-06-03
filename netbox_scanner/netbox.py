@@ -26,6 +26,8 @@ class RangeRecord:
     id: int = 0
     description: str = ""
     prefix: str | None = None
+    role_name: str | None = None
+    role_slug: str | None = None
 
 
 @dataclass(slots=True)
@@ -83,6 +85,25 @@ def _prefix_cidr(prefix: Any) -> str | None:
     return str(prefix_value) if prefix_value else None
 
 
+def parse_role(role: Any) -> tuple[str | None, str | None]:
+    if role is None:
+        return None, None
+    if isinstance(role, dict):
+        name = role.get("name")
+        slug = role.get("slug")
+        if not name and not slug:
+            for key in ("label", "value"):
+                value = role.get(key)
+                if value:
+                    return str(value), None
+        return (str(name) if name else None), (str(slug) if slug else None)
+    name = getattr(role, "name", None)
+    slug = getattr(role, "slug", None)
+    if name or slug:
+        return (str(name) if name else None), (str(slug) if slug else None)
+    return str(role), None
+
+
 def range_is_excluded(record: Any) -> bool:
     data = _as_mapping(record)
     custom_fields = data.get("custom_fields") or {}
@@ -109,6 +130,7 @@ def parse_prefix_record(record: Any) -> PrefixRecord:
 
 def parse_range_record(record: Any, *, prefix: str | None = None) -> RangeRecord:
     data = _as_mapping(record)
+    role_name, role_slug = parse_role(data.get("role"))
     return RangeRecord(
         id=int(data.get("id") or 0),
         name=str(data.get("name", "")),
@@ -117,6 +139,8 @@ def parse_range_record(record: Any, *, prefix: str | None = None) -> RangeRecord
         description=str(data.get("description") or ""),
         excluded=range_is_excluded(data),
         prefix=prefix or _prefix_cidr(data.get("prefix")),
+        role_name=role_name,
+        role_slug=role_slug,
     )
 
 
@@ -180,6 +204,26 @@ def apply_skip_ranges(records: list[RangeRecord], skip_names: list[str]) -> list
         return records
     skip = set(skip_names)
     return [record for record in records if record.name not in skip]
+
+
+def range_matches_skip_role(record: RangeRecord, skip_roles: list[str]) -> bool:
+    if not skip_roles:
+        return False
+    candidates: set[str] = set()
+    if record.role_name:
+        candidates.add(record.role_name.lower())
+    if record.role_slug:
+        candidates.add(record.role_slug.lower())
+    if not candidates:
+        return False
+    skip_lower = {role.lower() for role in skip_roles}
+    return bool(candidates & skip_lower)
+
+
+def apply_skip_roles(records: list[RangeRecord], skip_roles: list[str]) -> list[RangeRecord]:
+    if not skip_roles:
+        return records
+    return [record for record in records if not range_matches_skip_role(record, skip_roles)]
 
 
 def iter_range_ips(record: RangeRecord):

@@ -4,7 +4,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from .netbox import PrefixRecord
+from .netbox import PrefixRecord, range_matches_skip_role
 
 
 def parse_prefix_selection(raw: str, total: int) -> list[int]:
@@ -64,22 +64,30 @@ def render_range_plan(
     ranges: list,
     *,
     skipped_names: set[str],
+    skip_roles: list[str],
     console: Console | None = None,
 ) -> None:
     output = console or Console()
     table = Table(title="Scan Plan")
     table.add_column("Prefix")
     table.add_column("Range name")
+    table.add_column("Role")
     table.add_column("Start")
     table.add_column("End")
     table.add_column("Status")
     for record in ranges:
-        skipped = record.name in skipped_names
+        if record.name in skipped_names:
+            status = "skipped (name)"
+        elif range_matches_skip_role(record, skip_roles):
+            status = "skipped (role)"
+        else:
+            status = "scan"
         table.add_row(
             record.prefix or "",
             record.name,
+            record.role_name or "",
             record.start_address,
             record.end_address,
-            "skipped" if skipped else "scan",
+            status,
         )
     output.print(table)
