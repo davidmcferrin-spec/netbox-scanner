@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -107,8 +106,8 @@ def load_config(path: str | None = None) -> AppConfig:
 
     config = AppConfig(
         netbox=NetBoxConfig(
-            base_url=os.getenv("NETBOX_SCANNER_BASE_URL", netbox.get("base_url", "")),
-            api_token=os.getenv("NETBOX_SCANNER_API_TOKEN", netbox.get("api_token", "")),
+            base_url=str(netbox.get("base_url", "")),
+            api_token=str(netbox.get("api_token", "")),
             timeout=float(netbox.get("timeout", 30.0)),
             rate_limit=float(netbox.get("rate_limit", 0.0)),
         ),
@@ -144,11 +143,11 @@ def load_config(path: str | None = None) -> AppConfig:
 def validate_config(config: AppConfig) -> None:
     if not config.netbox.base_url.strip():
         raise ValueError(
-            "NetBox base_url is required. Set netbox.base_url in config or NETBOX_SCANNER_BASE_URL."
+            "NetBox base_url is required. Set netbox.base_url in your config file or pass --config."
         )
     if not config.netbox.api_token.strip():
         raise ValueError(
-            "NetBox api_token is required. Set netbox.api_token in config or NETBOX_SCANNER_API_TOKEN."
+            "NetBox api_token is required. Set netbox.api_token in your config file or pass --config."
         )
 
 

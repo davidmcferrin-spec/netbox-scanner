@@ -4,7 +4,7 @@
 
 ## Features
 
-- NetBox integration through `pynetbox` with config-file or environment-based credentials
+- NetBox integration through `pynetbox` with YAML config-file credentials
 - Prefix-driven scan selection with interactive multi-select (or config/CLI CIDRs)
 - Skip list for IP range names via config `skip_ranges` or `--skip-range`
 - Skip entire IP ranges by NetBox Role via config `skip_roles` (default: `DHCP Pool`) or `--skip-role`
@@ -54,7 +54,7 @@ Configuration is YAML. Both default locations use the same format as [`config.ex
 1. `--config /path/to/file.yaml` if passed on the CLI
 2. Otherwise `~/.netbox-scanner.conf` if it exists
 3. Otherwise `./config.yaml` in the current working directory if it exists
-4. Otherwise no file (NetBox credentials can still come from environment variables)
+4. Otherwise no file (you must pass `--config` or create one of the files above)
 
 ### When to use which
 
@@ -73,12 +73,7 @@ cp config.example.yaml ~/.netbox-scanner.conf   # user-wide
 cp config.example.yaml config.yaml              # project directory
 ```
 
-Edit the copy and set `netbox.base_url` and `netbox.api_token` (both required).
-
-Environment variables override values from whichever file is loaded:
-
-- `NETBOX_SCANNER_BASE_URL`
-- `NETBOX_SCANNER_API_TOKEN`
+Edit the copy and set `netbox.base_url` and `netbox.api_token` (both required). NetBox credentials are read from the config file only (shell environment variables are not used).
 
 ## Liveness verification
 

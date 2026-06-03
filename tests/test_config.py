@@ -1,8 +1,6 @@
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from netbox_scanner.config import AppConfig, NetBoxConfig, load_config, validate_config
 
@@ -15,7 +13,7 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "api_token is required"):
             validate_config(AppConfig(netbox=NetBoxConfig(base_url="https://netbox.example.com", api_token="")))
 
-    def test_load_config_applies_env_overrides(self):
+    def test_load_config_reads_netbox_credentials_from_file(self):
         yaml_text = """
 netbox:
   base_url: "https://file.example.com"
@@ -24,19 +22,10 @@ netbox:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "config.yaml"
             config_path.write_text(yaml_text, encoding="utf-8")
+            config = load_config(str(config_path))
 
-            with patch.dict(
-                os.environ,
-                {
-                    "NETBOX_SCANNER_BASE_URL": "https://env.example.com",
-                    "NETBOX_SCANNER_API_TOKEN": "env-token",
-                },
-                clear=False,
-            ):
-                config = load_config(str(config_path))
-
-        self.assertEqual("https://env.example.com", config.netbox.base_url)
-        self.assertEqual("env-token", config.netbox.api_token)
+        self.assertEqual("https://file.example.com", config.netbox.base_url)
+        self.assertEqual("file-token", config.netbox.api_token)
 
     def test_load_config_default_skip_roles(self):
         config = load_config("/nonexistent/config.yaml")

@@ -51,7 +51,7 @@ def _config_source_label(config_path: str | None) -> str:
     selected = _select_config_path(None)
     if selected and selected.exists():
         return str(selected)
-    return "environment variables only"
+    return "no config file loaded (use --config, ~/.netbox-scanner.conf, or ./config.yaml)"
 
 
 def _run_style(*, interactive: bool, scheduled: bool) -> str:
@@ -558,7 +558,7 @@ def _run_scan(
         config_source = _config_source_label(config_path)
         raise click.ClickException(
             f"{exc} Config source: {config_source}. "
-            "Compare with: curl -H \"Authorization: Token $NETBOX_SCANNER_API_TOKEN\" "
+            "Compare with: curl -H \"Authorization: Token <token-from-config>\" "
             f"{config.netbox.base_url.rstrip('/')}/api/status/"
         ) from exc
 

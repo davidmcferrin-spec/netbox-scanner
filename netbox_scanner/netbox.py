@@ -513,11 +513,7 @@ class NetBoxClient:
 
         status_code = getattr(getattr(exc, "req", None), "status_code", None)
         if status_code in (401, 403):
-            hint = (
-                " Check netbox.base_url and api_token in your config file. "
-                "Environment variables NETBOX_SCANNER_BASE_URL and NETBOX_SCANNER_API_TOKEN "
-                "override the config file when set."
-            )
+            hint = " Check netbox.base_url and api_token in your config file (or --config path)."
             raise RuntimeError(
                 f"NetBox authentication failed (HTTP {status_code}) for {self.base_url}.{hint}"
             ) from exc
@@ -545,9 +541,7 @@ class NetBoxClient:
             raise RuntimeError(
                 f"NetBox authentication failed (HTTP {response.status_code}) for {self.base_url}. "
                 "The API token was rejected (same check as GET /api/status/). "
-                "Ensure netbox.api_token in your config is valid. "
-                "If NETBOX_SCANNER_API_TOKEN or NETBOX_SCANNER_BASE_URL are set in the shell, "
-                "they override the config file."
+                "Ensure netbox.api_token and netbox.base_url in your config file match the token and URL used in curl."
             )
         try:
             response.raise_for_status()
