@@ -73,7 +73,7 @@ cp config.example.yaml ~/.netbox-scanner.conf   # user-wide
 cp config.example.yaml config.yaml              # project directory
 ```
 
-Edit the copy and set `netbox.base_url` and `netbox.api_token` (both required). NetBox credentials are read from the config file only (shell environment variables are not used).
+Edit the copy and set `netbox.base_url` and `netbox.api_token` (both required). NetBox credentials are read from the config file only (shell environment variables are not used). Both **v1** tokens (`Authorization: Token …`) and **v2** tokens from NetBox 4.5+ (`nbt_…` with `Authorization: Bearer …`) are detected automatically from the token string.
 
 ## Liveness verification
 
@@ -118,9 +118,9 @@ The API token needs:
 
 Each run prints a **Run Configuration** table (profile, speed, target mode, host count, write mode, and related settings) before scanning begins. When a host is **verified**, the CLI prints a **FIND** line with IP, PTR hostname, open ports, and whether it was added to NetBox (or why not).
 
-By default, the CLI fetches **prefixes** from NetBox and prompts you to pick one or more. The list shows **parent prefixes** (site aggregates) and **standalone** prefixes without a parent in NetBox. Child prefixes under a listed parent are hidden; selecting the parent scans **leaf child prefix CIDRs** (for example `/24` subnets under a `/16`). If a parent has no children, the parent CIDR is scanned. Use `--prefix` with a child CIDR to drill into one subnet only. Before you choose, answer **Show child prefixes?** to print which leaf CIDRs each parent row will scan.
+By default, the CLI fetches **prefixes** from NetBox and prompts you to pick one or more. The list shows **parent prefixes** (site aggregates) and **standalone** prefixes: rows with NetBox `_depth` greater than zero or a containing prefix in the fetched set are hidden. The **Site** column uses NetBox `scope` (or legacy `site`). The **Scan targets** column shows NetBox `children` when set, otherwise the count of leaf CIDRs that would be scanned. Selecting a parent scans **leaf child prefix CIDRs** (for example `/24` subnets under a `/16`). If a parent has no children, the parent CIDR is scanned. Use `--prefix` with a child CIDR to drill into one subnet only. Before you choose, answer **Show child prefixes?** to print which leaf CIDRs each parent row will scan.
 
-**Scan targets** are usable host addresses in those prefix CIDRs (not NetBox IP range records). **IP ranges** within the selected prefixes are used only to **exclude** addresses (reserved/excluded ranges, `skip_ranges`, and `skip_roles`).
+**Scan targets** (during the scan) are usable host addresses in those prefix CIDRs (not NetBox IP range records). **IP ranges** within the selected prefixes are used only to **exclude** addresses (reserved/excluded ranges, `skip_ranges`, and `skip_roles`).
 
 Skip IP ranges by **name** via config or CLI (exclusions):
 

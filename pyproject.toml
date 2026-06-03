@@ -9,7 +9,7 @@ description = "Scan NetBox IP ranges, verify DNS, and optionally write IP addres
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "pynetbox>=7.0.0,<8",
+    "pynetbox>=7.6.0,<8",
     "python-nmap>=0.7.1,<1",
     "dnspython>=2.4.0,<3",
     "click>=8.1.0,<9",

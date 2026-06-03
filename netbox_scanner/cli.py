@@ -15,6 +15,7 @@ from .config import AppConfig, _select_config_path, configure_logging, load_conf
 from .netbox import (
     NetBoxClient,
     RangeRecord,
+    netbox_authorization_scheme,
     apply_skip_ranges,
     apply_skip_roles,
     expand_prefixes_to_scan_cidrs,
@@ -31,6 +32,11 @@ _CIDR_PREVIEW_LIMIT = 10
 
 LOGGER = logging.getLogger(__name__)
 console = Console()
+
+
+def _clear_interactive_console() -> None:
+    if sys.stdout.isatty():
+        console.clear(home=True)
 
 
 @dataclass(slots=True)
@@ -538,6 +544,9 @@ def _run_scan(
     interactive: bool,
     scheduled: bool,
 ) -> None:
+    if interactive:
+        _clear_interactive_console()
+
     config = load_config(config_path)
     validate_config(config)
     configure_logging(config.logging)
@@ -558,7 +567,7 @@ def _run_scan(
         config_source = _config_source_label(config_path)
         raise click.ClickException(
             f"{exc} Config source: {config_source}. "
-            "Compare with: curl -H \"Authorization: Token <token-from-config>\" "
+            f"Compare with: curl -H \"Authorization: {netbox_authorization_scheme(config.netbox.api_token)} <token-from-config>\" "
             f"{config.netbox.base_url.rstrip('/')}/api/status/"
         ) from exc
 

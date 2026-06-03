@@ -8,6 +8,26 @@ from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
+# NetBox 4.5+ v2 tokens: nbt_<id>.<secret> (Bearer). Legacy v1 tokens use Token scheme.
+NETBOX_V2_TOKEN_PREFIX = "nbt_"
+
+
+def is_netbox_v2_token(token: str) -> bool:
+    """True when token matches NetBox v2 format (same rules as pynetbox >= 7.6)."""
+    value = token.strip()
+    if not value.startswith(NETBOX_V2_TOKEN_PREFIX):
+        return False
+    return "." in value[len(NETBOX_V2_TOKEN_PREFIX) :]
+
+
+def netbox_authorization_scheme(token: str) -> str:
+    return "Bearer" if is_netbox_v2_token(token) else "Token"
+
+
+def netbox_authorization_header(token: str) -> str:
+    value = token.strip()
+    return f"{netbox_authorization_scheme(value)} {value}"
+
 
 @dataclass(slots=True)
 class PrefixRecord:
@@ -16,6 +36,8 @@ class PrefixRecord:
     description: str
     site: str | None = None
     parent_id: int | None = None
+    children_count: int = 0
+    depth: int | None = None
 
 
 @dataclass(slots=True)
@@ -54,7 +76,10 @@ def _as_mapping(record: Any) -> dict[str, Any]:
         "excluded": getattr(record, "excluded", None),
         "custom_fields": getattr(record, "custom_fields", {}) or {},
         "site": getattr(record, "site", None),
+        "scope": getattr(record, "scope", None),
         "parent": getattr(record, "parent", None),
+        "children": getattr(record, "children", None),
+        "_depth": getattr(record, "_depth", getattr(record, "depth", None)),
     }
 
 
@@ -76,6 +101,29 @@ def _site_name(site: Any) -> str | None:
     if site is None:
         return None
     return str(site)
+
+
+def _record_site_name(data: dict[str, Any]) -> str | None:
+    """Site label from legacy ``site`` or NetBox 4.x ``scope`` (e.g. dcim.site)."""
+    site = _site_name(data.get("site"))
+    if site:
+        return site
+    return _site_name(data.get("scope"))
+
+
+def _record_depth(data: dict[str, Any]) -> int | None:
+    for key in ("_depth", "depth"):
+        value = data.get(key)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _record_children_count(data: dict[str, Any]) -> int:
+    value = data.get("children")
+    if value is None:
+        return 0
+    return int(value)
 
 
 def _prefix_cidr(prefix: Any) -> str | None:
@@ -140,8 +188,10 @@ def parse_prefix_record(record: Any) -> PrefixRecord:
         id=int(data.get("id") or 0),
         prefix=normalize_prefix_cidr(str(data.get("prefix", ""))),
         description=str(data.get("description") or ""),
-        site=_site_name(data.get("site")),
+        site=_record_site_name(data),
         parent_id=_parent_id(data.get("parent")),
+        children_count=_record_children_count(data),
+        depth=_record_depth(data),
     )
 
 
@@ -158,12 +208,108 @@ def children_by_parent(records: list[PrefixRecord]) -> dict[int, list[PrefixReco
     return children
 
 
-def prefixes_for_display(records: list[PrefixRecord]) -> list[PrefixRecord]:
-    """Parents and standalones for the picker: hide rows whose parent exists in NetBox."""
+def _prefix_network(record: PrefixRecord) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    return ipaddress.ip_network(record.prefix, strict=False)
+
+
+def immediate_containing_prefix(
+    record: PrefixRecord,
+    records: list[PrefixRecord],
+) -> PrefixRecord | None:
+    """Most specific other prefix in the set that strictly contains this one."""
+    network = _prefix_network(record)
+    best: PrefixRecord | None = None
+    best_prefixlen = -1
+    for candidate in records:
+        if candidate.id == record.id:
+            continue
+        try:
+            supernet = _prefix_network(candidate)
+        except ValueError:
+            continue
+        if network.subnet_of(supernet) and network != supernet:
+            if supernet.prefixlen > best_prefixlen:
+                best = candidate
+                best_prefixlen = supernet.prefixlen
+    return best
+
+
+def resolve_parent_record(
+    record: PrefixRecord,
+    records: list[PrefixRecord],
+    *,
+    index: dict[int, PrefixRecord] | None = None,
+) -> PrefixRecord | None:
+    prefix_index = index or build_prefix_index(records)
+    if record.parent_id is not None and record.parent_id in prefix_index:
+        return prefix_index[record.parent_id]
+    return immediate_containing_prefix(record, records)
+
+
+def build_prefix_children_map(records: list[PrefixRecord]) -> dict[int, list[PrefixRecord]]:
+    """Direct children: immediate NetBox parent or most specific containing prefix in the set."""
     index = build_prefix_index(records)
+    children: dict[int, list[PrefixRecord]] = {}
+    for record in records:
+        parent = resolve_parent_record(record, records, index=index)
+        if parent is None:
+            continue
+        children.setdefault(parent.id, []).append(record)
+    return children
+
+
+def _records_contained_in(
+    parent: PrefixRecord,
+    records: list[PrefixRecord],
+) -> list[PrefixRecord]:
+    parent_net = _prefix_network(parent)
+    contained: list[PrefixRecord] = []
+    for record in records:
+        if record.id == parent.id:
+            continue
+        try:
+            network = _prefix_network(record)
+        except ValueError:
+            continue
+        if network.subnet_of(parent_net) and network != parent_net:
+            contained.append(record)
+    return contained
+
+
+def maximal_prefixes_within(
+    parent: PrefixRecord,
+    records: list[PrefixRecord],
+) -> list[str]:
+    """Deepest prefixes inside parent among the set (no other listed prefix is a strict subnet)."""
+    contained = _records_contained_in(parent, records)
+    if not contained:
+        return [parent.prefix]
+
+    maximal: list[str] = []
+    for record in contained:
+        network = _prefix_network(record)
+        if any(
+            _prefix_network(other).subnet_of(network) and _prefix_network(other) != network
+            for other in contained
+            if other.id != record.id
+        ):
+            continue
+        maximal.append(record.prefix)
+    return sorted(maximal)
+
+
+def prefix_is_tree_child(record: PrefixRecord) -> bool:
+    """True when NetBox reports this prefix below the root of its hierarchy (_depth > 0)."""
+    return record.depth is not None and record.depth > 0
+
+
+def prefixes_for_display(records: list[PrefixRecord]) -> list[PrefixRecord]:
+    """Top-level prefixes for the picker: hide tree children and rows with a containing prefix."""
     display: list[PrefixRecord] = []
     for record in records:
-        if record.parent_id is not None and record.parent_id in index:
+        if prefix_is_tree_child(record):
+            continue
+        if resolve_parent_record(record, records) is not None:
             continue
         display.append(record)
     return sorted(display, key=lambda item: (item.site or "", item.prefix))
@@ -176,23 +322,15 @@ def prefix_has_children(
     return record.id in children
 
 
-def leaf_child_prefixes_for_parent(
-    record_id: int,
-    *,
-    children: dict[int, list[PrefixRecord]],
-) -> list[str]:
-    return sorted(_leaf_descendant_prefixes(record_id, children=children))
+def scan_targets_for_prefix(record: PrefixRecord, records: list[PrefixRecord]) -> list[str]:
+    return maximal_prefixes_within(record, records)
 
 
-def scan_preview_for_prefix(
-    record: PrefixRecord,
-    *,
-    children: dict[int, list[PrefixRecord]],
-) -> str:
-    leaf_children = leaf_child_prefixes_for_parent(record.id, children=children)
-    if leaf_children:
-        return ", ".join(leaf_children)
-    return "(scans this prefix)"
+def scan_preview_for_prefix(record: PrefixRecord, records: list[PrefixRecord]) -> str:
+    targets = scan_targets_for_prefix(record, records)
+    if targets == [record.prefix]:
+        return "(scans this prefix)"
+    return ", ".join(targets)
 
 
 def _record_by_cidr(records: list[PrefixRecord], cidr: str) -> PrefixRecord | None:
@@ -203,34 +341,22 @@ def _record_by_cidr(records: list[PrefixRecord], cidr: str) -> PrefixRecord | No
     return None
 
 
-def _leaf_descendant_prefixes(
-    root_id: int,
-    *,
-    children: dict[int, list[PrefixRecord]],
-) -> list[str]:
-    descendants = children.get(root_id, [])
-    if not descendants:
-        return []
-
-    leaves: list[str] = []
-    for child in descendants:
-        if child.id in children:
-            leaves.extend(_leaf_descendant_prefixes(child.id, children=children))
-        else:
-            leaves.append(child.prefix)
-    return leaves
+def count_scan_targets(record: PrefixRecord, records: list[PrefixRecord]) -> int:
+    return len(scan_targets_for_prefix(record, records))
 
 
-def count_leaf_descendants(
-    record: PrefixRecord,
-    *,
-    children: dict[int, list[PrefixRecord]],
-) -> int:
-    return len(leaf_child_prefixes_for_parent(record.id, children=children))
+def display_scan_target_count(record: PrefixRecord, records: list[PrefixRecord]) -> int:
+    """Count for the prefix picker: NetBox direct child count when set, else leaf CIDRs to scan."""
+    if record.children_count > 0:
+        return record.children_count
+    return count_scan_targets(record, records)
+
+
+def format_scan_target_label(count: int) -> str:
+    return str(count) if count > 1 else "-"
 
 
 def expand_prefixes_to_scan_cidrs(records: list[PrefixRecord], selected_cidrs: list[str]) -> list[str]:
-    children = children_by_parent(records)
     expanded: list[str] = []
     seen: set[str] = set()
 
@@ -243,11 +369,7 @@ def expand_prefixes_to_scan_cidrs(records: list[PrefixRecord], selected_cidrs: l
                 expanded.append(normalized)
             continue
 
-        scan_cidrs = _leaf_descendant_prefixes(record.id, children=children)
-        if not scan_cidrs:
-            scan_cidrs = [record.prefix]
-
-        for scan_cidr in scan_cidrs:
+        for scan_cidr in scan_targets_for_prefix(record, records):
             if scan_cidr in seen:
                 continue
             seen.add(scan_cidr)
@@ -481,7 +603,7 @@ class NetBoxClient:
         api=None,
     ) -> None:
         self.base_url = base_url
-        self.api_token = api_token
+        self.api_token = api_token.strip()
         self.timeout = timeout
         self.rate_limit = rate_limit
         self._api = api
@@ -529,7 +651,7 @@ class NetBoxClient:
             response = self.api.http_session.get(
                 url,
                 headers={
-                    "Authorization": f"Token {self.api_token}",
+                    "Authorization": netbox_authorization_header(self.api_token),
                     "Accept": "application/json",
                 },
                 timeout=self.timeout,
@@ -541,7 +663,8 @@ class NetBoxClient:
             raise RuntimeError(
                 f"NetBox authentication failed (HTTP {response.status_code}) for {self.base_url}. "
                 "The API token was rejected (same check as GET /api/status/). "
-                "Ensure netbox.api_token and netbox.base_url in your config file match the token and URL used in curl."
+                "Ensure netbox.api_token and netbox.base_url in your config file match the token and URL used in curl. "
+                f"Use Authorization: {netbox_authorization_scheme(self.api_token)} for this token format."
             )
         try:
             response.raise_for_status()

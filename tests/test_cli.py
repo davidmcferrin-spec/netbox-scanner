@@ -8,6 +8,7 @@ from rich.console import Console
 from netbox_scanner.config import AppConfig, DNSConfig, NetBoxConfig, ScannerConfig
 from netbox_scanner.cli import (
     ResolvedScanTargets,
+    _clear_interactive_console,
     format_verified_find_line,
     main,
     netbox_outcome_label,
@@ -60,6 +61,20 @@ class CliTests(unittest.TestCase):
         runner = CliRunner()
         result = runner.invoke(main, [])
         self.assertNotIn("Missing option '--ranges'", result.output)
+
+    def test_clear_interactive_console_when_tty(self):
+        with patch("netbox_scanner.cli.sys.stdout.isatty", return_value=True), patch(
+            "netbox_scanner.cli.console.clear"
+        ) as clear_mock:
+            _clear_interactive_console()
+        clear_mock.assert_called_once_with(home=True)
+
+    def test_clear_interactive_console_skips_non_tty(self):
+        with patch("netbox_scanner.cli.sys.stdout.isatty", return_value=False), patch(
+            "netbox_scanner.cli.console.clear"
+        ) as clear_mock:
+            _clear_interactive_console()
+        clear_mock.assert_not_called()
 
     def test_netbox_outcome_label_for_created_host(self):
         result = ScanResult(

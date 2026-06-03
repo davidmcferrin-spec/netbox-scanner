@@ -10,6 +10,8 @@ netbox:
   base_url: "https://netbox.example.com"
 
   # NetBox API token with read access to IP ranges and write access to IP addresses.
+  # v1 (legacy): 40-char key — curl uses Authorization: Token <key>
+  # v2 (NetBox 4.5+): nbt_<id>.<secret> — curl uses Authorization: Bearer <full-token>
 
   api_token: "replace-me"
 

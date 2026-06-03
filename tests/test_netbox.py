@@ -9,7 +9,10 @@ from netbox_scanner.netbox import (
     apply_skip_roles,
     collect_ranges_by_name,
     collect_ranges_within_prefixes,
+    is_netbox_v2_token,
     iter_unique_targets,
+    netbox_authorization_header,
+    netbox_authorization_scheme,
     normalize_hostname,
     parse_range_record,
     parse_role,
@@ -67,6 +70,25 @@ class FakeAPI:
             prefixes=FakePrefixes(prefixes or []),
         )
         self.http_session = SimpleNamespace(verify=True, timeout=None)
+
+
+class NetBoxAuthTests(unittest.TestCase):
+    def test_v1_token_uses_token_scheme(self):
+        token = "0123456789abcdef0123456789abcdef01234567"
+        self.assertFalse(is_netbox_v2_token(token))
+        self.assertEqual("Token", netbox_authorization_scheme(token))
+        self.assertEqual(f"Token {token}", netbox_authorization_header(token))
+
+    def test_v2_token_uses_bearer_scheme(self):
+        token = "nbt_abc123.def456ghi789"
+        self.assertTrue(is_netbox_v2_token(token))
+        self.assertEqual("Bearer", netbox_authorization_scheme(token))
+        self.assertEqual(f"Bearer {token}", netbox_authorization_header(token))
+
+    def test_v2_prefix_without_dot_is_v1_scheme(self):
+        token = "nbt_not-a-v2-token"
+        self.assertFalse(is_netbox_v2_token(token))
+        self.assertEqual("Token", netbox_authorization_scheme(token))
 
 
 class NetBoxTests(unittest.TestCase):
@@ -300,6 +322,23 @@ class NetBoxTests(unittest.TestCase):
 
         self.assertEqual("http://netbox.example.com/api/status/", fake_api.http_session.url)
         self.assertEqual("Token bad-token", fake_api.http_session.headers["Authorization"])
+
+    def test_verify_authentication_uses_bearer_for_v2_token(self):
+        response = SimpleNamespace(status_code=200, raise_for_status=lambda: None)
+
+        class FakeSession:
+            def get(self, url, headers=None, timeout=None):
+                self.headers = headers
+                return response
+
+        fake_api = FakeAPI({})
+        fake_api.http_session = FakeSession()
+        v2_token = "nbt_abc123.def456ghi789"
+        client = NetBoxClient("http://netbox.example.com", v2_token, api=fake_api)
+
+        client.verify_authentication()
+
+        self.assertEqual(f"Bearer {v2_token}", fake_api.http_session.headers["Authorization"])
 
     def test_auth_errors_fail_fast(self):
         request_error = self._make_request_error(401)

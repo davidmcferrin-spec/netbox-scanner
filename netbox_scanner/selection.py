@@ -6,7 +6,8 @@ from rich.table import Table
 
 from .netbox import (
     PrefixRecord,
-    children_by_parent,
+    display_scan_target_count,
+    format_scan_target_label,
     range_exclusion_reason,
     range_matches_skip_role,
     scan_preview_for_prefix,
@@ -40,7 +41,7 @@ def render_child_prefixes_table(
     all_prefixes: list[PrefixRecord] | None = None,
     console: Console | None = None,
 ) -> None:
-    children = children_by_parent(all_prefixes or display_prefixes)
+    all_records = all_prefixes or display_prefixes
     output = console or Console()
     table = Table(title="Child Prefixes To Scan")
     table.add_column("Parent / standalone")
@@ -48,7 +49,7 @@ def render_child_prefixes_table(
     for prefix in display_prefixes:
         table.add_row(
             prefix.prefix,
-            scan_preview_for_prefix(prefix, children=children),
+            scan_preview_for_prefix(prefix, all_records),
         )
     output.print(table)
 
@@ -62,18 +63,23 @@ def prompt_prefix_selection(
     if not prefixes:
         raise click.ClickException("No NetBox prefixes found.")
 
+    all_records = all_prefixes or prefixes
     output = console or Console()
     table = Table(title="NetBox Prefixes")
     table.add_column("#", justify="right")
     table.add_column("Prefix")
     table.add_column("Description")
     table.add_column("Site")
+    table.add_column("Scan targets", justify="right")
     for index, prefix in enumerate(prefixes, start=1):
+        target_count = display_scan_target_count(prefix, all_records)
+        target_label = format_scan_target_label(target_count)
         table.add_row(
             str(index),
             prefix.prefix,
             prefix.description,
             prefix.site or "",
+            target_label,
         )
     output.print(table)
 
