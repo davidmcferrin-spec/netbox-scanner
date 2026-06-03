@@ -6,13 +6,17 @@ import json
 import logging
 import re
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .dns_verify import lookup_dns
-from .netbox import NetBoxClient, RangeRecord, iter_unique_targets
+if __package__ is None:  # pragma: no cover - allow `python netbox_scanner/scanner.py`
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from netbox_scanner.dns_verify import lookup_dns
+from netbox_scanner.netbox import NetBoxClient, RangeRecord, iter_unique_targets
 
 LOGGER = logging.getLogger(__name__)
 
