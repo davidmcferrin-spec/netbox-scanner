@@ -15,6 +15,7 @@ class PrefixRecord:
     prefix: str
     description: str
     site: str | None = None
+    parent_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -53,6 +54,7 @@ def _as_mapping(record: Any) -> dict[str, Any]:
         "excluded": getattr(record, "excluded", None),
         "custom_fields": getattr(record, "custom_fields", {}) or {},
         "site": getattr(record, "site", None),
+        "parent": getattr(record, "parent", None),
     }
 
 
@@ -118,14 +120,115 @@ def range_is_excluded(record: Any) -> bool:
     ) or _choice_value(data.get("status")) == "reserved" or _choice_value(data.get("role")) == "excluded"
 
 
+def _parent_id(parent: Any) -> int | None:
+    if parent is None:
+        return None
+    if isinstance(parent, dict):
+        value = parent.get("id")
+        return int(value) if value else None
+    value = getattr(parent, "id", None)
+    return int(value) if value else None
+
+
+def normalize_prefix_cidr(cidr: str) -> str:
+    return str(ipaddress.ip_network(cidr, strict=False))
+
+
 def parse_prefix_record(record: Any) -> PrefixRecord:
     data = _as_mapping(record)
     return PrefixRecord(
         id=int(data.get("id") or 0),
-        prefix=str(data.get("prefix", "")),
+        prefix=normalize_prefix_cidr(str(data.get("prefix", ""))),
         description=str(data.get("description") or ""),
         site=_site_name(data.get("site")),
+        parent_id=_parent_id(data.get("parent")),
     )
+
+
+def build_prefix_index(records: list[PrefixRecord]) -> dict[int, PrefixRecord]:
+    return {record.id: record for record in records if record.id}
+
+
+def children_by_parent(records: list[PrefixRecord]) -> dict[int, list[PrefixRecord]]:
+    children: dict[int, list[PrefixRecord]] = {}
+    for record in records:
+        if record.parent_id is None:
+            continue
+        children.setdefault(record.parent_id, []).append(record)
+    return children
+
+
+def prefixes_for_display(records: list[PrefixRecord]) -> list[PrefixRecord]:
+    index = build_prefix_index(records)
+    display: list[PrefixRecord] = []
+    for record in records:
+        if record.parent_id is not None and record.parent_id in index:
+            continue
+        display.append(record)
+    return sorted(display, key=lambda item: (item.site or "", item.prefix))
+
+
+def _record_by_cidr(records: list[PrefixRecord], cidr: str) -> PrefixRecord | None:
+    normalized = normalize_prefix_cidr(cidr)
+    for record in records:
+        if record.prefix == normalized:
+            return record
+    return None
+
+
+def _leaf_descendant_prefixes(
+    root_id: int,
+    *,
+    children: dict[int, list[PrefixRecord]],
+) -> list[str]:
+    descendants = children.get(root_id, [])
+    if not descendants:
+        return []
+
+    leaves: list[str] = []
+    for child in descendants:
+        if child.id in children:
+            leaves.extend(_leaf_descendant_prefixes(child.id, children=children))
+        else:
+            leaves.append(child.prefix)
+    return leaves
+
+
+def count_leaf_descendants(
+    record: PrefixRecord,
+    *,
+    children: dict[int, list[PrefixRecord]],
+) -> int:
+    if record.id not in children:
+        return 0
+    return len(_leaf_descendant_prefixes(record.id, children=children))
+
+
+def expand_prefixes_to_scan_cidrs(records: list[PrefixRecord], selected_cidrs: list[str]) -> list[str]:
+    children = children_by_parent(records)
+    expanded: list[str] = []
+    seen: set[str] = set()
+
+    for cidr in selected_cidrs:
+        record = _record_by_cidr(records, cidr)
+        if record is None:
+            normalized = normalize_prefix_cidr(cidr)
+            if normalized not in seen:
+                seen.add(normalized)
+                expanded.append(normalized)
+            continue
+
+        scan_cidrs = _leaf_descendant_prefixes(record.id, children=children)
+        if not scan_cidrs:
+            scan_cidrs = [record.prefix]
+
+        for scan_cidr in scan_cidrs:
+            if scan_cidr in seen:
+                continue
+            seen.add(scan_cidr)
+            expanded.append(scan_cidr)
+
+    return expanded
 
 
 def parse_range_record(record: Any, *, prefix: str | None = None) -> RangeRecord:
@@ -235,6 +338,69 @@ def iter_range_ips(record: RangeRecord):
         yield ipaddress.ip_address(raw_value)
 
 
+def range_exclusion_reason(
+    record: RangeRecord,
+    *,
+    skip_names: list[str],
+    skip_roles: list[str],
+) -> str | None:
+    if record.excluded:
+        return "reserved/excluded"
+    if record.name in skip_names:
+        return "skip name"
+    if range_matches_skip_role(record, skip_roles):
+        return "skip role"
+    return None
+
+
+def collect_exclusion_ranges_for_prefixes(
+    api,
+    prefix_cidrs: list[str],
+    skip_names: list[str],
+    skip_roles: list[str],
+) -> list[RangeRecord]:
+    skip_name_set = set(skip_names)
+    exclusions: list[RangeRecord] = []
+    seen_ids: set[int] = set()
+
+    for record in collect_ranges_within_prefixes(api, prefix_cidrs):
+        if range_exclusion_reason(record, skip_names=skip_name_set, skip_roles=skip_roles) is None:
+            continue
+        if record.id:
+            if record.id in seen_ids:
+                continue
+            seen_ids.add(record.id)
+        exclusions.append(record)
+
+    return exclusions
+
+
+def iter_prefix_hosts(cidr: str):
+    network = ipaddress.ip_network(cidr, strict=False)
+    yield from network.hosts()
+
+
+def iter_unique_targets_from_prefixes(
+    prefix_cidrs: list[str],
+    *,
+    max_hosts: int | None = None,
+) -> list[str]:
+    seen: set[str] = set()
+    targets: list[str] = []
+    for cidr in prefix_cidrs:
+        for ip in iter_prefix_hosts(cidr):
+            ip_str = str(ip)
+            if ip_str in seen:
+                continue
+            seen.add(ip_str)
+            targets.append(ip_str)
+            if max_hosts is not None and len(targets) > max_hosts:
+                raise ValueError(
+                    f"Scan target count ({len(targets)}) exceeds --max-hosts limit ({max_hosts})."
+                )
+    return targets
+
+
 def iter_unique_targets(
     records: list[RangeRecord],
     *,
@@ -334,6 +500,15 @@ class NetBoxClient:
     def fetch_ranges_within_prefixes(self, prefix_cidrs: list[str]) -> list[RangeRecord]:
         self._sleep()
         return collect_ranges_within_prefixes(self.api, prefix_cidrs)
+
+    def fetch_exclusion_ranges_for_prefixes(
+        self,
+        prefix_cidrs: list[str],
+        skip_names: list[str],
+        skip_roles: list[str],
+    ) -> list[RangeRecord]:
+        self._sleep()
+        return collect_exclusion_ranges_for_prefixes(self.api, prefix_cidrs, skip_names, skip_roles)
 
     def fetch_scan_ranges(self, names: list[str]) -> list[RangeRecord]:
         self._sleep()

@@ -69,11 +69,11 @@ scanner:
 
   ping_timeout: 1
 
-  # Unattended/scheduled runs: prefix CIDRs to scan (all contained IP ranges included).
+  # Unattended/scheduled runs: parent or standalone prefix CIDRs (parents expand to child prefixes).
 
   prefixes: []
 
-  # IP range names to never scan (exact name match).
+  # IP range names whose addresses are excluded from prefix scans (exact name match).
 
   skip_ranges:
 
@@ -81,8 +81,8 @@ scanner:
 
     - "mgmt-excluded"
 
-  # IP range roles to never scan (matches NetBox role name or slug; case-insensitive).
-  # Default skips "DHCP Pool". Set to [] to disable role-based skipping.
+  # IP range roles whose addresses are excluded from prefix scans (name or slug; case-insensitive).
+  # Default skips "DHCP Pool". Set to [] to disable role-based exclusions.
 
   skip_roles:
 

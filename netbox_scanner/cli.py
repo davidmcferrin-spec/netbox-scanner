@@ -10,10 +10,16 @@ from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
 from .config import AppConfig, configure_logging, load_config, validate_config
-from .netbox import NetBoxClient, apply_skip_ranges, apply_skip_roles
+from .netbox import (
+    NetBoxClient,
+    apply_skip_ranges,
+    apply_skip_roles,
+    expand_prefixes_to_scan_cidrs,
+    prefixes_for_display,
+)
 from .scanner import NetworkScanner, export_results
 from .scheduler import run_on_schedule
-from .selection import prompt_prefix_selection, render_range_plan
+from .selection import prompt_prefix_selection, render_prefix_scan_plan, render_range_plan
 
 
 LOGGER = logging.getLogger(__name__)
@@ -156,30 +162,39 @@ def _resolve_scan_targets(
                 "Scheduled/unattended runs require scanner.prefixes in config, --prefix, or --ranges."
             )
     else:
-        prefix_records = client.fetch_prefixes()
-        selected_prefixes = prompt_prefix_selection(prefix_records, console=console)
-
-    all_ranges = client.fetch_ranges_within_prefixes(selected_prefixes)
-    if not all_ranges:
-        prefix_list = ", ".join(selected_prefixes)
-        raise click.ClickException(f"No IP ranges found within prefixes: {prefix_list}")
-
-    scan_ranges = apply_skip_ranges(all_ranges, skip_ranges)
-    scan_ranges = apply_skip_roles(scan_ranges, skip_roles)
-    if not scan_ranges:
-        raise click.ClickException(
-            "All IP ranges were skipped by skip_ranges or skip_roles configuration."
+        all_prefixes = client.fetch_prefixes()
+        display_prefixes = prefixes_for_display(all_prefixes)
+        if not display_prefixes:
+            raise click.ClickException("No NetBox prefixes found.")
+        selected_prefixes = prompt_prefix_selection(
+            display_prefixes,
+            all_prefixes=all_prefixes,
+            console=console,
         )
 
+    all_prefixes = client.fetch_prefixes()
+
+    scan_prefixes = expand_prefixes_to_scan_cidrs(all_prefixes, selected_prefixes)
+    if not scan_prefixes:
+        prefix_list = ", ".join(selected_prefixes)
+        raise click.ClickException(f"No scan prefixes resolved from selection: {prefix_list}")
+
+    exclusion_ranges = client.fetch_exclusion_ranges_for_prefixes(
+        scan_prefixes,
+        skip_ranges,
+        skip_roles,
+    )
+
     if interactive:
-        render_range_plan(
-            all_ranges,
-            skipped_names=skip_name_set,
+        render_prefix_scan_plan(
+            scan_prefixes=scan_prefixes,
+            exclusion_ranges=exclusion_ranges,
+            skip_names=skip_name_set,
             skip_roles=skip_roles,
             console=console,
         )
 
-    return selected_prefixes, scan_ranges
+    return selected_prefixes, scan_prefixes
 
 
 def _run_scan(
@@ -216,7 +231,7 @@ def _run_scan(
     )
     scanner = NetworkScanner(config=config, netbox_client=client)
 
-    _, scan_ranges = _resolve_scan_targets(
+    _, targets = _resolve_scan_targets(
         client,
         config,
         ranges=ranges,
@@ -234,8 +249,13 @@ def _run_scan(
         "dry_run": dry_run,
         "auto_confirm": auto_confirm,
         "max_hosts": max_hosts,
-        "scan_ranges": scan_ranges,
+        "skip_range_names": skip_ranges,
+        "skip_role_names": skip_roles,
     }
+    if ranges:
+        run_kwargs["scan_ranges"] = targets
+    else:
+        run_kwargs["scan_prefixes"] = targets
 
     if interactive:
         with Progress(

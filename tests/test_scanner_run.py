@@ -202,6 +202,42 @@ class ScannerRunTests(unittest.TestCase):
         self.assertEqual(1, len(verified))
         self.assertEqual([443], verified[0].open_ports)
 
+    def test_run_accepts_scan_prefixes(self):
+        nmap_scanner = MagicMock()
+        nmap_scanner.scan.return_value = self._verified_nmap_response("10.0.0.1")
+        scanner = self._make_scanner(lambda ip: ip == "10.0.0.1", nmap_scanner)
+
+        self.netbox_client.fetch_exclusion_ranges_for_prefixes.return_value = [
+            RangeRecord(
+                name="dhcp",
+                start_address="10.0.0.2",
+                end_address="10.0.0.2",
+                excluded=False,
+                role_name="DHCP Pool",
+            )
+        ]
+
+        dns_result = DNSLookupResult(ip="10.0.0.1", ptr_hostname="host.example.com", reason="lookup_ok")
+        self.netbox_client.evaluate_ip_address.return_value = IpAddressWriteResult(
+            status="not_found",
+            payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "host.example.com"},
+        )
+
+        with patch("netbox_scanner.scanner.lookup_dns", return_value=dns_result):
+            summary = scanner.run(
+                scan_prefixes=["10.0.0.0/30"],
+                profile="services",
+                speed="polite",
+                skip_role_names=["DHCP Pool"],
+                dry_run=True,
+            )
+
+        self.assertEqual(2, summary.total_hosts)
+        excluded = [result for result in summary.results if result.excluded]
+        self.assertEqual(1, len(excluded))
+        self.assertEqual("10.0.0.2", excluded[0].ip)
+        self.netbox_client.fetch_exclusion_ranges_for_prefixes.assert_called_once()
+
     def test_run_accepts_scan_ranges_directly(self):
         nmap_scanner = MagicMock()
         nmap_scanner.scan.return_value = {

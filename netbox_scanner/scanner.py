@@ -16,7 +16,12 @@ if __package__ is None:  # pragma: no cover - allow `python netbox_scanner/scann
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from netbox_scanner.dns_verify import lookup_dns
-from netbox_scanner.netbox import NetBoxClient, RangeRecord, iter_unique_targets
+from netbox_scanner.netbox import (
+    NetBoxClient,
+    RangeRecord,
+    iter_unique_targets,
+    iter_unique_targets_from_prefixes,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -228,6 +233,9 @@ class NetworkScanner:
         *,
         range_names: list[str] | None = None,
         scan_ranges: list[RangeRecord] | None = None,
+        scan_prefixes: list[str] | None = None,
+        skip_range_names: list[str] | None = None,
+        skip_role_names: list[str] | None = None,
         profile: str,
         speed: str,
         exclude_file: str | None = None,
@@ -241,22 +249,37 @@ class NetworkScanner:
             raise ValueError(f"Unknown scan profile: {profile}")
 
         profile_items = self.config.scanner.profiles[profile]
-        if scan_ranges is not None:
-            resolved_ranges = scan_ranges
-        elif range_names:
-            resolved_ranges = self.netbox_client.fetch_scan_ranges(range_names)
-        else:
-            raise ValueError("Either scan_ranges or range_names must be provided.")
-
-        if not resolved_ranges:
-            raise ValueError("No NetBox IP ranges matched the selection.")
-
         excluded_ranges = self.netbox_client.fetch_excluded_ranges()
         exclusions = range_records_to_exclusions(excluded_ranges) + parse_exclusions_file(exclude_file)
 
-        targets = iter_unique_targets(resolved_ranges, max_hosts=max_hosts)
-        if not targets:
-            raise ValueError("No scan targets found in the selected NetBox IP ranges.")
+        if scan_prefixes is not None:
+            if not scan_prefixes:
+                raise ValueError("No scan prefixes resolved from the selection.")
+            prefix_exclusions = self.netbox_client.fetch_exclusion_ranges_for_prefixes(
+                scan_prefixes,
+                skip_range_names or [],
+                skip_role_names or [],
+            )
+            exclusions.extend(range_records_to_exclusions(prefix_exclusions))
+            targets = iter_unique_targets_from_prefixes(scan_prefixes, max_hosts=max_hosts)
+            if not targets:
+                raise ValueError("No scan targets found in the selected prefixes.")
+        elif scan_ranges is not None:
+            resolved_ranges = scan_ranges
+            if not resolved_ranges:
+                raise ValueError("No NetBox IP ranges matched the selection.")
+            targets = iter_unique_targets(resolved_ranges, max_hosts=max_hosts)
+            if not targets:
+                raise ValueError("No scan targets found in the selected NetBox IP ranges.")
+        elif range_names:
+            resolved_ranges = self.netbox_client.fetch_scan_ranges(range_names)
+            if not resolved_ranges:
+                raise ValueError("No NetBox IP ranges matched the selection.")
+            targets = iter_unique_targets(resolved_ranges, max_hosts=max_hosts)
+            if not targets:
+                raise ValueError("No scan targets found in the selected NetBox IP ranges.")
+        else:
+            raise ValueError("Provide scan_prefixes, scan_ranges, or range_names.")
 
         summary = ScanSummary(total_hosts=len(targets))
 

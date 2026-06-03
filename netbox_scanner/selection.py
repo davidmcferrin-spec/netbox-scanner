@@ -4,7 +4,13 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from .netbox import PrefixRecord, range_matches_skip_role
+from .netbox import (
+    PrefixRecord,
+    children_by_parent,
+    count_leaf_descendants,
+    range_exclusion_reason,
+    range_matches_skip_role,
+)
 
 
 def parse_prefix_selection(raw: str, total: int) -> list[int]:
@@ -28,22 +34,32 @@ def parse_prefix_selection(raw: str, total: int) -> list[int]:
     return indices
 
 
-def prompt_prefix_selection(prefixes: list[PrefixRecord], *, console: Console | None = None) -> list[str]:
+def prompt_prefix_selection(
+    prefixes: list[PrefixRecord],
+    *,
+    all_prefixes: list[PrefixRecord] | None = None,
+    console: Console | None = None,
+) -> list[str]:
     if not prefixes:
         raise click.ClickException("No NetBox prefixes found.")
 
+    children = children_by_parent(all_prefixes or prefixes)
     output = console or Console()
     table = Table(title="NetBox Prefixes")
     table.add_column("#", justify="right")
     table.add_column("Prefix")
     table.add_column("Description")
     table.add_column("Site")
+    table.add_column("Children", justify="right")
     for index, prefix in enumerate(prefixes, start=1):
+        child_count = count_leaf_descendants(prefix, children=children)
+        child_label = str(child_count) if child_count else "-"
         table.add_row(
             str(index),
             prefix.prefix,
             prefix.description,
             prefix.site or "",
+            child_label,
         )
     output.print(table)
 
@@ -68,7 +84,7 @@ def render_range_plan(
     console: Console | None = None,
 ) -> None:
     output = console or Console()
-    table = Table(title="Scan Plan")
+    table = Table(title="Scan Plan (legacy IP ranges)")
     table.add_column("Prefix")
     table.add_column("Range name")
     table.add_column("Role")
@@ -91,3 +107,42 @@ def render_range_plan(
             status,
         )
     output.print(table)
+
+
+def render_prefix_scan_plan(
+    *,
+    scan_prefixes: list[str],
+    exclusion_ranges: list,
+    skip_names: set[str],
+    skip_roles: list[str],
+    console: Console | None = None,
+) -> None:
+    output = console or Console()
+
+    prefix_table = Table(title="Scan Prefixes")
+    prefix_table.add_column("Prefix")
+    for cidr in scan_prefixes:
+        prefix_table.add_row(cidr)
+    output.print(prefix_table)
+
+    exclusion_table = Table(title="IP Range Exclusions")
+    exclusion_table.add_column("Prefix")
+    exclusion_table.add_column("Range name")
+    exclusion_table.add_column("Role")
+    exclusion_table.add_column("Start")
+    exclusion_table.add_column("End")
+    exclusion_table.add_column("Reason")
+    for record in exclusion_ranges:
+        reason = range_exclusion_reason(record, skip_names=skip_names, skip_roles=skip_roles)
+        exclusion_table.add_row(
+            record.prefix or "",
+            record.name,
+            record.role_name or "",
+            record.start_address,
+            record.end_address,
+            reason or "excluded",
+        )
+    if exclusion_ranges:
+        output.print(exclusion_table)
+    else:
+        output.print("[dim]No IP range exclusions in selected prefixes.[/dim]")

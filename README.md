@@ -121,9 +121,11 @@ The API token needs:
 
 ## Choosing what to scan
 
-By default, the CLI fetches **prefixes** from NetBox and prompts you to pick one or more (no manual name entry). All **IP ranges contained in those prefixes** are included automatically, including multiple NetBox records with the same range name.
+By default, the CLI fetches **prefixes** from NetBox and prompts you to pick one or more. The list shows **parent prefixes** (site aggregates) and **standalone** prefixes without a parent in NetBox. Child prefixes under a listed parent are hidden; selecting the parent scans **leaf child prefix CIDRs** (for example `/24` subnets under a `/16`). If a parent has no children, the parent CIDR is scanned. Use `--prefix` with a child CIDR to drill into one subnet only.
 
-Skip IP ranges by **name** via config or CLI:
+**Scan targets** are usable host addresses in those prefix CIDRs (not NetBox IP range records). **IP ranges** within the selected prefixes are used only to **exclude** addresses (reserved/excluded ranges, `skip_ranges`, and `skip_roles`).
+
+Skip IP ranges by **name** via config or CLI (exclusions):
 
 ```yaml
 scanner:
@@ -136,7 +138,7 @@ scanner:
 python -m netbox_scanner.cli --skip-range "reserved-loopbacks" --dry-run
 ```
 
-Skip entire IP ranges by NetBox **Role** (not individual IPs within a range). By default, ranges with role `"DHCP Pool"` are excluded from the scan pool. This is separate from `skip_ranges` (by name) and from reserved/excluded ranges whose IPs are subtracted from targets inside other ranges.
+Skip entire IP ranges by NetBox **Role** (not individual IPs within a range). By default, ranges with role `"DHCP Pool"` are excluded from scanning. This is separate from `skip_ranges` (by name) and from reserved/excluded ranges whose IPs are subtracted from prefix targets.
 
 ```yaml
 scanner:
@@ -150,13 +152,13 @@ Set `skip_roles: []` in config to disable role-based skipping. Use `--skip-role`
 python -m netbox_scanner.cli --skip-role "VIP Pool" --dry-run
 ```
 
-For scheduled/unattended runs, set prefixes in config:
+For scheduled/unattended runs, set parent or standalone prefix CIDRs in config (parent entries expand to child prefixes automatically):
 
 ```yaml
 scanner:
   prefixes:
-    - "10.10.0.0/24"
-    - "10.20.0.0/23"
+    - "10.114.0.0/16"
+    - "10.200.0.0/24"
   skip_ranges:
     - "do-not-scan"
 ```
@@ -169,10 +171,11 @@ scanner:
 python -m netbox_scanner.cli --dry-run
 ```
 
-**Explicit prefix CIDR(s):**
+**Explicit prefix CIDR(s)** (parent or child drill-down):
 
 ```bash
-python -m netbox_scanner.cli --prefix 10.10.0.0/24 --prefix 10.20.0.0/23 --dry-run
+python -m netbox_scanner.cli --prefix 10.114.0.0/16 --dry-run
+python -m netbox_scanner.cli --prefix 10.114.50.0/24 --dry-run
 ```
 
 **Legacy name-based selection** (still supported):
