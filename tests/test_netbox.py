@@ -14,8 +14,11 @@ from netbox_scanner.netbox import (
     build_supplemental_update,
     duplicate_address_from_error,
     evaluate_existing_ip_address,
+    DEFAULT_VERIFIED_TAG_SLUG,
+    PREVIOUS_DNS_NAME_PREFIX,
     merge_checkmk_tag,
     merge_no_ptr_discovery_note,
+    merge_tag_slugs,
     NoPtrDiscovery,
     host_matches_address,
     is_duplicate_ip_address_error,
@@ -29,6 +32,11 @@ from netbox_scanner.netbox import (
     collect_ranges_within_prefixes,
     is_netbox_v2_token,
     iter_unique_targets,
+    iter_unique_targets_from_prefixes,
+    maximal_prefixes_within,
+    PrefixRecord,
+    sort_hosts_numeric,
+    sort_prefix_cidrs_numeric,
     netbox_authorization_header,
     netbox_authorization_scheme,
     normalize_hostname,
@@ -38,6 +46,7 @@ from netbox_scanner.netbox import (
     range_is_excluded,
     range_matches_skip_role,
     record_dns_name,
+    record_tag_slugs,
     resolve_skip_role_slugs,
 )
 from netbox_scanner.netbox import RangeRecord
@@ -189,6 +198,13 @@ class FakeIPAddresses:
         return None
 
     def filter(self, **kwargs):
+        if "tag" in kwargs:
+            slug = str(kwargs["tag"]).lower()
+            return [
+                record
+                for record in self.records.values()
+                if slug in record_tag_slugs(record)
+            ]
         if "host" in kwargs:
             target = ipaddress.ip_address(kwargs["host"])
             return [
@@ -312,6 +328,36 @@ class NetBoxTests(unittest.TestCase):
 
         self.assertTrue(record.excluded)
         self.assertEqual("lab", record.name)
+
+    def test_sort_prefix_cidrs_numeric_orders_by_address_not_string(self):
+        ordered = sort_prefix_cidrs_numeric(
+            ["10.70.127.0/24", "10.70.40.0/26", "10.70.40.0/24"]
+        )
+        self.assertEqual(
+            ["10.70.40.0/24", "10.70.40.0/26", "10.70.127.0/24"],
+            ordered,
+        )
+
+    def test_sort_hosts_numeric_orders_octets(self):
+        ordered = sort_hosts_numeric(["10.70.127.2", "10.70.40.10", "10.70.40.1"])
+        self.assertEqual(["10.70.40.1", "10.70.40.10", "10.70.127.2"], ordered)
+
+    def test_iter_unique_targets_from_prefixes_scans_subnets_in_numeric_order(self):
+        targets = iter_unique_targets_from_prefixes(["10.70.127.0/30", "10.70.40.0/30"])
+        self.assertEqual(
+            ["10.70.40.1", "10.70.40.2", "10.70.127.1", "10.70.127.2"],
+            targets,
+        )
+
+    def test_maximal_prefixes_within_sorts_child_cidrs_numerically(self):
+        parent = PrefixRecord(id=1, prefix="10.70.0.0/16", description="site")
+        children = [
+            PrefixRecord(id=2, prefix="10.70.127.0/24", description=""),
+            PrefixRecord(id=3, prefix="10.70.40.0/24", description=""),
+            PrefixRecord(id=4, prefix="10.70.40.0/26", description=""),
+        ]
+        maximal = maximal_prefixes_within(parent, [parent, *children])
+        self.assertEqual(["10.70.40.0/26", "10.70.127.0/24"], maximal)
 
     def test_iter_unique_targets_deduplicates_overlapping_ranges(self):
         records = [
@@ -697,7 +743,9 @@ class NetBoxTests(unittest.TestCase):
         self.assertEqual(1, len(ip_addresses.updated))
         record = ip_addresses.records["10.98.0.10/22"]
         self.assertEqual("new.nexstar.tv", record["dns_name"])
-        self.assertIn("Previous dns_name: old.nexstar.tv (netbox-scanner)", record["description"])
+        self.assertIn(PREVIOUS_DNS_NAME_PREFIX, record["description"])
+        self.assertIn("old.nexstar.tv", record["description"])
+        self.assertIn("@", record["description"])
 
     def test_evaluate_ip_address_reports_drift(self):
         ip_addresses = FakeIPAddresses(
@@ -716,7 +764,8 @@ class NetBoxTests(unittest.TestCase):
 
         self.assertEqual("drift", result.status)
         self.assertEqual("old.example.com", result.netbox_dns_name)
-        self.assertIn("Previous dns_name: old.example.com (netbox-scanner)", result.update_payload["description"])
+        self.assertIn(PREVIOUS_DNS_NAME_PREFIX, result.update_payload["description"])
+        self.assertIn("old.example.com", result.update_payload["description"])
         self.assertIn("manual note", result.update_payload["description"])
         self.assertEqual("new.example.com", result.update_payload["dns_name"])
         self.assertIsInstance(result.update_payload["id"], int)
@@ -738,20 +787,25 @@ class NetBoxTests(unittest.TestCase):
         self.assertIn("manual", supplemental["description"])
 
     def test_build_no_ptr_discovery_note_lists_ports_and_profile(self):
-        note = build_no_ptr_discovery_note(
-            NoPtrDiscovery(open_ports=[22, 80], profile="services", nmap_up=True)
-        )
+        with patch("netbox_scanner.netbox.scanner_note_timestamp", return_value="2026-06-03 12:00:00 UTC"):
+            note = build_no_ptr_discovery_note(
+                "",
+                NoPtrDiscovery(open_ports=[22, 80], profile="services", nmap_up=True),
+            )
         self.assertIn("ICMP OK", note)
         self.assertIn("open ports: 22,80", note)
         self.assertIn("profile=services", note)
+        self.assertIn("@ 2026-06-03 12:00:00 UTC", note)
 
     def test_merge_no_ptr_discovery_note_replaces_previous_scanner_line(self):
         old = "manual note\nnetbox-scanner: verified (no PTR); ICMP OK; open ports: 22"
-        new = build_no_ptr_discovery_note(NoPtrDiscovery(open_ports=[443], profile="services"))
-        merged = merge_no_ptr_discovery_note(old, new)
+        discovery = NoPtrDiscovery(open_ports=[443], profile="services")
+        with patch("netbox_scanner.netbox.scanner_note_timestamp", return_value="2026-06-03 12:00:00 UTC"):
+            merged = merge_no_ptr_discovery_note(old, discovery)
         self.assertIn("manual note", merged)
         self.assertIn("open ports: 443", merged)
         self.assertNotIn("open ports: 22", merged)
+        self.assertEqual(1, merged.count("netbox-scanner: verified (no PTR)"))
 
     def test_build_ip_address_payload_sets_description_without_ptr(self):
         discovery = NoPtrDiscovery(open_ports=[161], profile="services")
@@ -790,10 +844,20 @@ class NetBoxTests(unittest.TestCase):
         self.assertIn("open ports: 22,443", record["description"])
 
     def test_append_previous_dns_name_note_uses_none_placeholder(self):
-        self.assertEqual(
-            "Previous dns_name: (none) (netbox-scanner)",
-            append_previous_dns_name_note("", None),
-        )
+        with patch("netbox_scanner.netbox.scanner_note_timestamp", return_value="2026-06-03 12:00:00 UTC"):
+            note = append_previous_dns_name_note("", None)
+        self.assertIn(PREVIOUS_DNS_NAME_PREFIX, note)
+        self.assertIn("(none)", note)
+        self.assertIn("@ 2026-06-03 12:00:00 UTC", note)
+
+    def test_merge_previous_dns_name_note_replaces_legacy_line(self):
+        old = "manual\nPrevious dns_name: stale.example.com (netbox-scanner)"
+        with patch("netbox_scanner.netbox.scanner_note_timestamp", return_value="2026-06-03 12:00:00 UTC"):
+            merged = append_previous_dns_name_note(old, "new.example.com")
+        self.assertIn("manual", merged)
+        self.assertIn("new.example.com", merged)
+        self.assertNotIn("stale.example.com", merged)
+        self.assertEqual(1, merged.count(PREVIOUS_DNS_NAME_PREFIX))
 
     def test_is_no_data_provided_error_detects_netbox_message(self):
         exc = make_no_data_provided_error()
@@ -825,7 +889,8 @@ class NetBoxTests(unittest.TestCase):
         record = ip_addresses.records["10.0.0.1/32"]
         self.assertEqual("new.example.com", record["dns_name"])
         self.assertIn("keep me", record["description"])
-        self.assertIn("Previous dns_name: old.example.com (netbox-scanner)", record["description"])
+        self.assertIn(PREVIOUS_DNS_NAME_PREFIX, record["description"])
+        self.assertIn("old.example.com", record["description"])
 
     def test_upsert_ip_address_skips_unchanged_record(self):
         ip_addresses = FakeIPAddresses(
@@ -864,6 +929,36 @@ class NetBoxTests(unittest.TestCase):
             merge_checkmk_tag(existing, "checkmk"),
         )
 
+    def test_merge_tag_slugs_adds_verified_and_checkmk(self):
+        existing = {"id": 1, "tags": [{"slug": "production"}]}
+        self.assertEqual(
+            [
+                {"slug": "checkmk"},
+                {"slug": DEFAULT_VERIFIED_TAG_SLUG},
+                {"slug": "production"},
+            ],
+            merge_tag_slugs(existing, ["checkmk", DEFAULT_VERIFIED_TAG_SLUG]),
+        )
+
+    def test_evaluate_ip_address_requests_verified_tag_when_dns_matches(self):
+        existing = {
+            "id": 2,
+            "address": "10.0.0.2/32",
+            "dns_name": "host.example.com",
+            "tags": [],
+        }
+        evaluation = evaluate_existing_ip_address(
+            existing,
+            ip="10.0.0.2",
+            hostname="host.example.com",
+            payload={"address": "10.0.0.2/32", "status": "active", "dns_name": "host.example.com"},
+            apply_verified_tag=True,
+            verified_tag_slug=DEFAULT_VERIFIED_TAG_SLUG,
+        )
+        self.assertEqual("tag_update", evaluation.status)
+        slugs = {tag["slug"] for tag in evaluation.update_payload["tags"]}
+        self.assertEqual({DEFAULT_VERIFIED_TAG_SLUG}, slugs)
+
     def test_upsert_ip_address_applies_checkmk_tag_on_create(self):
         ip_addresses = FakeIPAddresses()
         client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
@@ -879,6 +974,22 @@ class NetBoxTests(unittest.TestCase):
         self.assertEqual("created", result.status)
         record = ip_addresses.records["10.0.0.3/32"]
         self.assertEqual([{"slug": "checkmk"}], record["tags"])
+
+    def test_upsert_ip_address_applies_verified_tag_on_create(self):
+        ip_addresses = FakeIPAddresses()
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.upsert_ip_address(
+            "10.0.0.11",
+            hostname="verified.example.com",
+            dry_run=False,
+            apply_verified_tag=True,
+            verified_tag_slug=DEFAULT_VERIFIED_TAG_SLUG,
+        )
+
+        self.assertEqual("created", result.status)
+        record = ip_addresses.records["10.0.0.11/32"]
+        self.assertEqual([{"slug": DEFAULT_VERIFIED_TAG_SLUG}], record["tags"])
 
     def test_upsert_ip_address_applies_checkmk_tag_when_already_exists(self):
         ip_addresses = FakeIPAddresses(
@@ -932,6 +1043,73 @@ class NetBoxTests(unittest.TestCase):
 
         self.assertEqual("10.0.0.1/32", payload["address"])
         self.assertEqual("host.example.com", payload["dns_name"])
+
+    def test_fetch_ip_addresses_with_tag_missing_dns(self):
+        ip_addresses = FakeIPAddresses(
+            {
+                "10.0.0.1/32": {
+                    "id": 1,
+                    "address": "10.0.0.1/32",
+                    "tags": [{"slug": "checkmk"}],
+                },
+                "10.0.0.2/32": {
+                    "id": 2,
+                    "address": "10.0.0.2/32",
+                    "dns_name": "has-dns.example.com",
+                    "tags": [{"slug": "checkmk"}],
+                },
+                "10.0.0.3/32": {
+                    "id": 3,
+                    "address": "10.0.0.3/32",
+                    "tags": [{"slug": "other"}],
+                },
+            }
+        )
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        records = client.fetch_ip_addresses_with_tag_missing_dns("checkmk")
+
+        self.assertEqual(1, len(records))
+        self.assertEqual("10.0.0.1/32", records[0]["address"])
+
+    def test_sync_dns_name_from_checkmk_updates_empty_dns(self):
+        ip_addresses = FakeIPAddresses(
+            {"10.0.0.5/32": {"id": 5, "address": "10.0.0.5/32", "tags": [{"slug": "checkmk"}]}}
+        )
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.sync_dns_name_from_checkmk("10.0.0.5", "cmk-host.example.com", dry_run=False)
+
+        self.assertEqual("updated", result.status)
+        self.assertEqual("cmk-host.example.com", ip_addresses.records["10.0.0.5/32"]["dns_name"])
+
+    def test_sync_dns_name_from_checkmk_skips_existing_dns(self):
+        ip_addresses = FakeIPAddresses(
+            {
+                "10.0.0.6/32": {
+                    "id": 6,
+                    "address": "10.0.0.6/32",
+                    "dns_name": "keep.example.com",
+                }
+            }
+        )
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.sync_dns_name_from_checkmk("10.0.0.6", "cmk-host.example.com", dry_run=False)
+
+        self.assertEqual("already_exists", result.status)
+        self.assertEqual("keep.example.com", ip_addresses.records["10.0.0.6/32"]["dns_name"])
+        self.assertEqual([], ip_addresses.updated)
+
+    def test_sync_dns_name_from_checkmk_dry_run(self):
+        ip_addresses = FakeIPAddresses({"10.0.0.7/32": {"id": 7, "address": "10.0.0.7/32"}})
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.sync_dns_name_from_checkmk("10.0.0.7", "planned.example.com", dry_run=True)
+
+        self.assertEqual("drift", result.status)
+        self.assertEqual("planned.example.com", result.update_payload["dns_name"])
+        self.assertEqual([], ip_addresses.updated)
 
     def test_api_property_applies_http_timeout(self):
         client = NetBoxClient("https://netbox.example.com", "token", timeout=42.0)

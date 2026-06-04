@@ -1,3 +1,4 @@
+import ipaddress
 import unittest
 
 from netbox_scanner.netbox import (
@@ -190,6 +191,18 @@ class PrefixHierarchyTests(unittest.TestCase):
         targets = iter_unique_targets_from_prefixes(["10.0.0.0/30", "10.0.0.0/30"])
 
         self.assertEqual(["10.0.0.1", "10.0.0.2"], targets)
+
+    def test_iter_unique_targets_from_prefixes_mixed_prefix_lengths_in_numeric_order(self):
+        prefixes = ["10.70.127.0/24", "10.70.0.0/22", "10.70.40.0/26"]
+        sorted_prefixes = sorted(prefixes, key=lambda cidr: ipaddress.ip_address(cidr.split("/")[0]))
+        self.assertEqual(
+            ["10.70.0.0/22", "10.70.40.0/26", "10.70.127.0/24"],
+            sorted_prefixes,
+        )
+        targets = iter_unique_targets_from_prefixes(prefixes)
+        idx_40 = targets.index("10.70.40.1")
+        idx_127 = targets.index("10.70.127.1")
+        self.assertLess(idx_40, idx_127)
 
     def test_collect_exclusion_ranges_for_prefixes(self):
         dhcp_range = {

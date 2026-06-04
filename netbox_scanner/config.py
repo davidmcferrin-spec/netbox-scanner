@@ -1,3 +1,17 @@
+"""YAML configuration loading for netbox-scanner.
+
+Sections (see config.example.yaml and README.md):
+  netbox   — API URL, token, timeouts
+  checkmk  — optional monitoring REST lookup and dns_name sync
+  dns      — optional resolvers for PTR/forward lookups
+  logging  — level and log file
+  scanner  — profiles, speeds, prefixes, fast path, parallel nmap, checkpoint,
+             custom field slugs, verified tag (behavior keys are flat under scanner)
+  stale    — global miss counter, delete rules, phantom tag
+
+Only one config file is loaded; path resolution is in _select_config_path().
+"""
+
 from __future__ import annotations
 
 import logging
@@ -7,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkmk import CheckMKConfig
+from .metadata import MetadataFieldSlugs, ScannerBehaviorConfig, StalePolicyConfig
 
 try:
     import yaml
@@ -50,6 +65,8 @@ class ScannerConfig:
     skip_ranges: list[str] = field(default_factory=list)
     skip_roles: list[str] = field(default_factory=lambda: ["DHCP Pool"])
     lock_file: str = ""
+    verified_tag_slug: str = "netbox-scanner"
+    behavior: ScannerBehaviorConfig = field(default_factory=ScannerBehaviorConfig)
     profiles: dict[str, list[str]] = field(
         default_factory=lambda: {
             "services": ["-sS", "-sU", "T:22,23,80,443,445,U:161"],
@@ -123,6 +140,41 @@ def load_config(path: str | None = None) -> AppConfig:
     dns = raw.get("dns", {})
     logging_cfg = raw.get("logging", {})
     scanner = raw.get("scanner", {})
+    stale = raw.get("stale", {})
+
+    metadata = MetadataFieldSlugs(
+        last_verified_at=str(
+            scanner.get("custom_field_last_verified_at", MetadataFieldSlugs().last_verified_at)
+        ),
+        last_verified_profile=str(
+            scanner.get(
+                "custom_field_last_verified_profile",
+                MetadataFieldSlugs().last_verified_profile,
+            )
+        ),
+        last_open_ports=str(
+            scanner.get("custom_field_last_open_ports", MetadataFieldSlugs().last_open_ports)
+        ),
+        scanner_miss_count=str(
+            scanner.get("custom_field_miss_count", MetadataFieldSlugs().scanner_miss_count)
+        ),
+    )
+    stale_policy = StalePolicyConfig(
+        scope_tag=str(stale.get("scope_tag", scanner.get("verified_tag_slug", "netbox-scanner"))),
+        miss_threshold=int(stale.get("miss_threshold", 5)),
+        delete_unassigned_only=bool(stale.get("delete_unassigned_only", True)),
+        exempt_checkmk=bool(stale.get("exempt_checkmk", True)),
+        dry_run_deletes=bool(stale.get("dry_run_deletes", True)),
+        phantom_tag_slug=str(stale.get("phantom_tag_slug", "netbox-scanner-phantom")),
+    )
+    behavior = ScannerBehaviorConfig(
+        fast_path_existing_netbox=bool(scanner.get("fast_path_existing_netbox", True)),
+        parallel_workers=max(1, min(int(scanner.get("parallel_workers", 4)), 16)),
+        nmap_batch_prefixlen=int(scanner.get("nmap_batch_prefixlen", 24)),
+        checkpoint_path=str(scanner.get("checkpoint_path", "")),
+        metadata_fields=metadata,
+        stale=stale_policy,
+    )
 
     config = AppConfig(
         netbox=NetBoxConfig(
@@ -166,9 +218,19 @@ def load_config(path: str | None = None) -> AppConfig:
                 for key, value in scanner.get("profiles", ScannerConfig().profiles).items()
             },
             lock_file=str(scanner.get("lock_file", "")),
+            verified_tag_slug=str(
+                scanner.get("verified_tag_slug", ScannerConfig().verified_tag_slug)
+            ),
+            behavior=behavior,
         ),
     )
     return config
+
+
+def validate_scanner_behavior(config: AppConfig) -> None:
+    workers = config.scanner.behavior.parallel_workers
+    if workers < 1 or workers > 16:
+        raise ValueError("scanner.parallel_workers must be between 1 and 16.")
 
 
 def validate_config(config: AppConfig) -> None:
@@ -193,6 +255,7 @@ def validate_config(config: AppConfig) -> None:
             raise ValueError(
                 "checkmk.automation_secret is required when checkmk.enabled is true."
             )
+    validate_scanner_behavior(config)
 
 
 PACKAGE_LOGGER_NAME = "netbox_scanner"

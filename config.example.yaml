@@ -1,168 +1,243 @@
-# netbox-scanner configuration (YAML).
-# Copy to ~/.netbox-scanner.conf (user-wide, checked first) or ./config.yaml (project directory).
-# Only one file is loaded; if both exist, the home file wins. Override with: --config /path/to/file.yaml
-# Do not commit real API tokens if using ./config.yaml in a git checkout.
+# =============================================================================
+# netbox-scanner configuration (YAML)
+# =============================================================================
+#
+# Copy to one location (only ONE file is loaded; they are NOT merged):
+#
+#   ~/.netbox-scanner.conf     — user-wide (checked first if both exist)
+#   ./config.yaml             — project directory
+#
+# Override path:  python -m netbox_scanner.cli --config /path/to/file.yaml
+#
+# Do NOT commit real API tokens in git. Use ~/.netbox-scanner.conf on shared hosts.
+#
+# Full documentation: README.md
+#   - Operating modes (scan vs backfill vs reverify vs stale-only)
+#   - All CLI flags
+#   - NetBox tags + custom fields to create first
+#
+# =============================================================================
 
+
+# -----------------------------------------------------------------------------
+# netbox — API connection (required)
+# -----------------------------------------------------------------------------
 netbox:
 
-  # NetBox API base URL.
-
+  # Base URL of your NetBox instance (no trailing path).
   base_url: "https://netbox.example.com"
 
-  # NetBox API token with read access to IP ranges and write access to IP addresses.
-  # v1 (legacy): 40-char key — curl uses Authorization: Token <key>
-  # v2 (NetBox 4.5+): nbt_<id>.<secret> — curl uses Authorization: Bearer <full-token>
-
+  # API token. Permissions: read prefixes/ip-ranges; read+write ip-addresses;
+  # read tags; delete ip-addresses if using --apply-stale-deletes.
+  # v1 legacy: 40-char key  → Authorization: Token <key>
+  # v2 NetBox 4.5+: nbt_<id>.<secret>  → Authorization: Bearer <full-token>
   api_token: "replace-me"
 
-  # HTTP timeout in seconds.
-
+  # HTTP timeout in seconds for NetBox API calls.
   timeout: 30
 
-  # Delay in seconds between NetBox API calls (setup/plan only; use 0 for fast interactive setup).
-
+  # Delay in seconds between NetBox API calls during setup/planning (prefix
+  # picker, range fetch). Does NOT delay per-host scan loop. Use 0 for fast UI.
   rate_limit: 0
 
 
-
+# -----------------------------------------------------------------------------
+# checkmk — optional CheckMK 2.4+ REST (Community Edition)
+# -----------------------------------------------------------------------------
+# When enabled: per-IP lookup on verified hosts; optional tag; optional dns sync.
+# Requires checkmk.enabled: true for --sync-checkmk-dns and --backfill-checkmk-dns.
 checkmk:
 
-  # Optional CheckMK 2.4+ REST integration (per-IP lookup during verified-host NetBox writes).
-
+  # Master switch. false = no CheckMK HTTP calls.
   enabled: false
 
-  # CheckMK site root (with optional site path). Do not include /check_mk/api/1.0.
-
+  # CheckMK site root URL (may include site path).
+  # CORRECT:   https://nagios.example.com/NewsNation
+  # WRONG:     .../check_mk/api/1.0  (appended automatically)
   base_url: "https://checkmk.example.com/monitoring"
 
+  # Automation user and secret for Bearer auth:
+  #   Authorization: Bearer <automation_user> <automation_secret>
   automation_user: "automation"
-
   automation_secret: "replace-me"
 
-  # NetBox tag slug to assign when CheckMK has a host for the IP (create in Extras → Tags first).
-
+  # NetBox tag slug when CheckMK returns a host for the IP.
+  # Create tag in NetBox first. Also used by --backfill-checkmk-dns to select
+  # IPs with empty dns_name that have this tag.
   tag_slug: "checkmk"
 
+  # HTTP timeout per CheckMK request (seconds).
   timeout: 10
 
+  # Minimum seconds between CheckMK API calls (0 = no delay).
   rate_limit: 0
 
+  # Set false if TLS verification fails (e.g. internal CA / -k in curl).
   verify_ssl: true
 
 
-
+# -----------------------------------------------------------------------------
+# dns — optional resolvers for PTR and forward (A/CNAME) lookups
+# -----------------------------------------------------------------------------
+# Empty servers list = use system resolver.
 dns:
 
-  # Optional custom recursive resolvers for PTR/A lookups.
-
   servers:
-
     - "1.1.1.1"
-
     - "8.8.8.8"
 
-  # DNS lookup timeout in seconds.
-
+  # Per-query timeout (seconds).
   timeout: 2
 
 
-
+# -----------------------------------------------------------------------------
+# logging
+# -----------------------------------------------------------------------------
 logging:
 
-  # Python log level.
-
+  # Python log level: DEBUG, INFO, WARNING, ERROR
   level: "INFO"
 
-  # Log file for stdout/file dual logging and scheduled runs.
-
+  # Log file path (used for scheduled runs and file logging).
   file: "netbox-scanner.log"
 
 
-
+# -----------------------------------------------------------------------------
+# scanner — scan behavior, profiles, and NetBox metadata field slugs
+# -----------------------------------------------------------------------------
 scanner:
 
-  # Default scan profile: services probes SSH, Telnet, HTTP/S, SMB, and SNMP only.
+  # --- Tags ---
+  # NetBox tag applied when a host is verified and written successfully.
+  # Create in Extras → Tags before first write. Used by stale.scope_tag default.
+  verified_tag_slug: "netbox-scanner"
 
+  # --- Fast path (existing NetBox IPs in prefix) ---
+  # true: IPs already in NetBox for the scanned prefix are checked with ICMP
+  # ping and/or PTR only (no nmap). Valid = ping OK OR PTR returns a hostname.
+  # false: every IP gets full ping + nmap (slow on large prefixes).
+  fast_path_existing_netbox: true
+
+  # --- Parallel nmap (new IPs only) ---
+  # Number of concurrent subnet batch scans (1–16). Default 4.
+  parallel_workers: 4
+
+  # Group new (non–fast-path) hosts into subnets of this prefix length for
+  # batched nmap (e.g. 24 = /24 batches).
+  nmap_batch_prefixlen: 24
+
+  # --- Checkpoint / --resume ---
+  # JSON file tracking completed IPs per prefix CIDR.
+  # Empty string = ~/.netbox-scanner-checkpoint.json
+  checkpoint_path: ""
+
+  # --- NetBox custom field slugs (IP Address object) ---
+  # Create each field in NetBox Extras → Custom Fields before use.
+  # Written on successful verify / fast-path refresh / reverify.
+  custom_field_last_verified_at: "last_verified_at"       # text or datetime
+  custom_field_last_verified_profile: "last_verified_profile"  # text
+  custom_field_last_open_ports: "last_open_ports"           # text (comma ports)
+  custom_field_miss_count: "scanner_miss_count"             # integer
+
+  # --- Default scan ---
+  # Profile and speed used when CLI omits --profile / --speed.
   default_profile: "services"
+  default_speed: "polite"    # maps to nmap -T2; see README for all speeds
 
-  # Default nmap timing (-T2 polite). Use sneaky or paranoid to reduce scan visibility.
-
-  default_speed: "polite"
-
-  # Delay in seconds between nmap scans per host.
-
+  # Seconds to wait between nmap batch/host operations in the scan loop.
   scan_rate_limit: 0.5
 
-  # ICMP ping timeout in seconds. ICMP ping always runs before nmap on every IP.
-
+  # ICMP ping timeout (seconds). Ping always runs before nmap on full-scan path.
   ping_timeout: 1
 
-  # Unattended/scheduled runs: parent or standalone prefix CIDRs (parents expand to child prefixes).
-
+  # --- Unattended / scheduled runs (--schedule) ---
+  # Parent or leaf prefix CIDRs to scan when not using interactive picker.
+  # Parent entries expand to leaf child prefixes in NetBox automatically.
   prefixes: []
 
-  # Lock file while a scan is running (default: ~/.netbox-scanner.lock). Removed on normal exit or Ctrl+C.
-
+  # --- Run lock ---
+  # Prevents two scanner processes at once. Default ~/.netbox-scanner.lock
   lock_file: ""
 
-  # IP range names whose addresses are excluded from prefix scans (exact name match).
-
+  # --- Exclusions (prefix scan mode) ---
+  # NetBox IP range *names* to exclude (exact match). Also overridable via CLI.
   skip_ranges:
-
     - "reserved-loopbacks"
-
     - "mgmt-excluded"
 
-  # IP range roles whose address spans are excluded inside scan prefixes (not whole subnets).
-  # Name or slug; case-insensitive (DHCP Pool, DHCP-Pool, dhcp-pool are equivalent). Set to [] to disable.
-
+  # NetBox IP range *roles* whose address spans are skipped inside selected
+  # prefixes (not whole subnets). Case-insensitive name/slug matching.
+  # Set to [] to disable role-based skipping.
   skip_roles:
+    - "DHCP Pool"
 
-    - "DHCP Pool"   # also matches DHCP-Pool / dhcp-pool (case-insensitive)
-
-  # Named scan profiles. Values can be port lists/ranges or raw nmap flags.
-
+  # --- Scan profiles ---
+  # CLI: --profile <name>
+  # Items starting with "-" are passed to nmap as flags.
+  # Other items are port specifications (comma-separated allowed).
   profiles:
 
-    # TCP 22, 23, 80, 443, 445 and UDP 161 (SNMP). Requires root/cap_net_raw for -sS/-sU.
-
+    # Default: common admin/service ports. Requires cap_net_raw for -sS/-sU.
     services:
-
       - "-sS"
-
       - "-sU"
-
       - "T:22,23,80,443,445,U:161"
 
     web:
-
       - "80"
-
       - "443"
-
       - "8080"
-
       - "8443"
 
     media:
-
       - "554"
-
       - "8554"
-
       - "1935"
 
-    # Opt-in exhaustive scan only. Not used by default.
-
+    # Opt-in full port range; very slow.
     full:
-
       - "1-65535"
 
-    # SYN scan of the same service ports without UDP.
-
+    # TCP SYN on service ports (no UDP in this profile definition).
     stealth:
-
       - "-sS"
-
       - "T:22,23,80,443,445,8080,8443,544,1935,U:161"
 
+
+# -----------------------------------------------------------------------------
+# stale — global lifecycle for tagged IPs (netbox-scanner tag)
+# -----------------------------------------------------------------------------
+# Used by:
+#   --stale-report          report IPs at/above miss_threshold (global tag scope)
+#   --apply-stale-deletes   delete eligible IPs (see rules below)
+#   --reverify-tagged       increments/resets scanner_miss_count
+# Fast path miss (no ping, no PTR) also increments scanner_miss_count.
+stale:
+
+  # NetBox tag that defines "managed by scanner" for stale/reverify (global).
+  # Usually same as scanner.verified_tag_slug.
+  scope_tag: "netbox-scanner"
+
+  # Delete considered when custom field scanner_miss_count >= this value
+  # (consecutive failed ping+PTR checks on fast path or --reverify-tagged).
+  miss_threshold: 5
+
+  # If true, never delete IPs assigned to a device interface in NetBox.
+  delete_unassigned_only: true
+
+  # If true, never delete when CheckMK still has a host for the IP (requires
+  # checkmk.enabled for lookup at delete time).
+  exempt_checkmk: true
+
+  # Config-side gate for actual NetBox deletes (see README delete decision table):
+  #   true  (default) — --stale-report alone reports would_delete only; need
+  #                     --apply-stale-deletes to delete (unless --dry-run)
+  #   false — DANGEROUS: --stale-report alone may DELETE without
+  #                     --apply-stale-deletes; only set false if you rely on
+  #                     --apply-stale-deletes as the sole safety switch
+  # CLI --dry-run always suppresses deletes (standalone or post-scan).
+  dry_run_deletes: true
+
+  # NetBox tag for ping_only (phantom) hosts during full port scan when the IP
+  # record already exists in NetBox. Create tag or set "" to disable.
+  phantom_tag_slug: "netbox-scanner-phantom"

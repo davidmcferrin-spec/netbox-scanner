@@ -381,3 +381,46 @@ class CliTests(unittest.TestCase):
             )
 
         scanner.run.assert_called_once()
+
+    def test_main_rejects_both_checkmk_dns_flags(self):
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["--sync-checkmk-dns", "--backfill-checkmk-dns"],
+        )
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("not both", result.output)
+
+    def test_backfill_checkmk_dns_requires_enabled(self):
+        runner = CliRunner()
+        config = AppConfig(netbox=NetBoxConfig(base_url="https://netbox.example.com", api_token="token"))
+
+        with patch("netbox_scanner.cli.load_config", return_value=config), patch(
+            "netbox_scanner.cli.validate_config"
+        ):
+            result = runner.invoke(main, ["--backfill-checkmk-dns"])
+
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("checkmk.enabled", result.output)
+
+    def test_backfill_checkmk_dns_runs_without_scan(self):
+        runner = CliRunner()
+        config = AppConfig(netbox=NetBoxConfig(base_url="https://netbox.example.com", api_token="token"))
+        from netbox_scanner.checkmk import CheckMKConfig
+
+        config.checkmk = CheckMKConfig(
+            enabled=True,
+            base_url="https://checkmk.example.com",
+            automation_user="user",
+            automation_secret="secret",
+        )
+
+        with patch("netbox_scanner.cli.load_config", return_value=config), patch(
+            "netbox_scanner.cli.validate_config"
+        ), patch("netbox_scanner.cli.run_lock", return_value=MagicMock()), patch(
+            "netbox_scanner.cli._run_checkmk_dns_backfill_locked"
+        ) as backfill_locked:
+            result = runner.invoke(main, ["--backfill-checkmk-dns", "--dry-run"])
+
+        self.assertEqual(0, result.exit_code, result.output)
+        backfill_locked.assert_called_once()

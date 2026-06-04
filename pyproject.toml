@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "netbox-scanner"
 version = "0.2.0"
-description = "Scan NetBox IP ranges, verify DNS, and optionally write IP address records back to NetBox."
+description = "Scan NetBox prefixes, verify liveness (ping/nmap/DNS), optional CheckMK integration, lifecycle metadata, stale policy, and global re-verify."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

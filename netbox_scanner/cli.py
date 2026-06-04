@@ -12,6 +12,7 @@ from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
 from .checkmk import CheckMKClient
+from .checkmk_sync import CheckMKDnsBackfillSummary, run_checkmk_dns_backfill
 from .config import AppConfig, _select_config_path, configure_logging, load_config, validate_config
 from .netbox import (
     NetBoxClient,
@@ -25,7 +26,10 @@ from .netbox import (
     iter_unique_targets_from_prefixes,
     prefixes_for_display,
 )
+from .gap_report import GapReport
+from .reverify import run_reverify_tagged
 from .scanner import NetworkScanner, ScanResult, export_results, timing_for_speed
+from .stale_policy import StalePolicySummary, process_global_stale_deletes
 from .run_lock import RunLockError, run_lock
 from .scheduler import run_on_schedule
 from .selection import prompt_prefix_selection, render_prefix_scan_plan, render_range_plan
@@ -92,6 +96,22 @@ def _value_column_width(output_console: Console | None = None) -> int:
     return max(30, effective_width(output_console) - 22)
 
 
+def _validate_checkmk_dns_flags(
+    config: AppConfig,
+    *,
+    sync_checkmk_dns: bool,
+    backfill_checkmk_dns: bool,
+) -> None:
+    if sync_checkmk_dns and backfill_checkmk_dns:
+        raise click.UsageError(
+            "Use only one of --sync-checkmk-dns and --backfill-checkmk-dns, not both."
+        )
+    if (sync_checkmk_dns or backfill_checkmk_dns) and not config.checkmk.enabled:
+        raise click.UsageError(
+            "CheckMK DNS sync requires checkmk.enabled: true in your config file."
+        )
+
+
 def _write_mode_label(*, dry_run: bool, confirm: bool, auto_confirm: bool) -> str:
     if dry_run:
         return "dry-run (no NetBox writes)"
@@ -149,10 +169,12 @@ def render_run_configuration(
     interactive: bool,
     scheduled: bool,
     host_count_label: str,
+    sync_checkmk_dns: bool = False,
+    backfill_checkmk_dns: bool = False,
     console: Console | None = None,
 ) -> None:
     output_console = console or Console()
-    nmap_timing = timing_for_speed(speed)
+    nmap_timing = timing_for_speed(speed) if not backfill_checkmk_dns else "-"
 
     table = Table(title="Run Configuration")
     value_max = _value_column_width(output_console)
@@ -203,6 +225,11 @@ def render_run_configuration(
     table.add_row("DNS timeout (s)", str(config.dns.timeout))
     table.add_row("NetBox HTTP timeout (s)", str(config.netbox.timeout))
     table.add_row("NetBox API delay (s)", str(config.netbox.rate_limit))
+    table.add_row("Verified tag slug", config.scanner.verified_tag_slug)
+    behavior = config.scanner.behavior
+    table.add_row("Fast path (existing NetBox)", "yes" if behavior.fast_path_existing_netbox else "no")
+    table.add_row("Parallel nmap workers", str(behavior.parallel_workers))
+    table.add_row("Stale miss threshold", str(behavior.stale.miss_threshold))
     table.add_row("CheckMK", "enabled" if config.checkmk.enabled else "disabled")
     if config.checkmk.enabled:
         table.add_row("CheckMK URL", config.checkmk.base_url)
@@ -212,6 +239,8 @@ def render_run_configuration(
         )
         table.add_row("CheckMK tag slug", config.checkmk.tag_slug)
         table.add_row("CheckMK API delay (s)", str(config.checkmk.rate_limit))
+        table.add_row("CheckMK dns sync (scan)", "yes" if sync_checkmk_dns else "no")
+        table.add_row("CheckMK dns backfill", "yes" if backfill_checkmk_dns else "no")
 
     table.add_row("Skip range names", format_list_preview(skip_ranges))
     table.add_row("Skip range roles", format_list_preview(skip_roles))
@@ -313,6 +342,8 @@ def format_checkmk_field(result: ScanResult) -> str | None:
         return None
     if result.checkmk_monitored:
         label = result.checkmk_host_name or "yes"
+        if result.checkmk_dns_synced:
+            return f"CheckMK={label} (dns synced)"
         return f"CheckMK={label}"
     return "CheckMK=no"
 
@@ -654,6 +685,203 @@ def _resolve_scan_targets(
     )
 
 
+def render_checkmk_dns_backfill_summary(
+    summary: CheckMKDnsBackfillSummary,
+    *,
+    dry_run: bool,
+    console: Console | None = None,
+) -> None:
+    output_console = console or Console()
+    table = Table(title="CheckMK DNS Backfill Summary")
+    table.add_column("Metric", no_wrap=True)
+    table.add_column("Count", justify="right")
+    table.add_row("Tagged IPs examined", str(summary.examined))
+    if dry_run:
+        table.add_row("Would update dns_name", str(summary.dry_run_planned))
+    else:
+        table.add_row("dns_name synced", str(summary.synced))
+    table.add_row("Skipped (no CheckMK host)", str(summary.skipped_no_checkmk_host))
+    table.add_row("Skipped (not in NetBox)", str(summary.skipped_not_in_netbox))
+    table.add_row("Errors", str(summary.errors))
+    output_console.print(table)
+
+
+def render_checkmk_dns_backfill_configuration(
+    *,
+    config: AppConfig,
+    config_path: str | None,
+    dry_run: bool,
+    console: Console | None = None,
+) -> None:
+    output_console = console or Console()
+    table = Table(title="CheckMK DNS Backfill")
+    value_max = _value_column_width(output_console)
+    table.add_column("Setting", no_wrap=True)
+    table.add_column("Value", overflow="fold", max_width=value_max)
+    table.add_row("Config source", _config_source_label(config_path))
+    table.add_row("NetBox URL", config.netbox.base_url)
+    table.add_row("CheckMK URL", config.checkmk.base_url)
+    table.add_row("NetBox tag filter", config.checkmk.tag_slug)
+    table.add_row("Mode", "dry-run (no writes)" if dry_run else "write dns_name from CheckMK")
+    output_console.print(table)
+
+
+def _run_checkmk_dns_backfill(
+    *,
+    config_path: str | None,
+    dry_run: bool,
+) -> None:
+    config = load_config(config_path)
+    validate_config(config)
+    _validate_checkmk_dns_flags(
+        config,
+        sync_checkmk_dns=False,
+        backfill_checkmk_dns=True,
+    )
+    try:
+        with run_lock(config.scanner.lock_file):
+            _run_checkmk_dns_backfill_locked(
+                config=config,
+                config_path=config_path,
+                dry_run=dry_run,
+            )
+    except RunLockError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _run_checkmk_dns_backfill_locked(
+    *,
+    config: AppConfig,
+    config_path: str | None,
+    dry_run: bool,
+) -> None:
+    configure_logging(config.logging, console=True)
+    client = NetBoxClient(
+        config.netbox.base_url,
+        config.netbox.api_token,
+        timeout=config.netbox.timeout,
+        rate_limit=config.netbox.rate_limit,
+    )
+    try:
+        client.verify_authentication()
+    except RuntimeError as exc:
+        config_source = _config_source_label(config_path)
+        raise click.ClickException(f"{exc}\nConfig source: {config_source}.") from exc
+
+    checkmk_client = CheckMKClient(config.checkmk)
+    render_checkmk_dns_backfill_configuration(
+        config=config,
+        config_path=config_path,
+        dry_run=dry_run,
+        console=console,
+    )
+    summary = run_checkmk_dns_backfill(
+        client,
+        checkmk_client,
+        config.checkmk,
+        dry_run=dry_run,
+    )
+    render_checkmk_dns_backfill_summary(summary, dry_run=dry_run, console=console)
+    LOGGER.info(
+        "CheckMK DNS backfill complete examined=%s synced=%s dry_run_planned=%s skipped_no_host=%s errors=%s",
+        summary.examined,
+        summary.synced,
+        summary.dry_run_planned,
+        summary.skipped_no_checkmk_host,
+        summary.errors,
+    )
+
+
+def render_gap_report(report: GapReport, console: Console | None = None) -> None:
+    output_console = console or Console()
+    table = Table(title="Coverage / Gap Report")
+    table.add_column("Category", no_wrap=True)
+    table.add_column("Count", justify="right")
+    table.add_row("Verified, written, not in prefix index", str(len(report.verified_not_in_netbox)))
+    table.add_row("Tagged, not in this scan", str(len(report.netbox_tagged_not_scanned)))
+    table.add_row("Tagged, unreachable this scan", str(len(report.unreachable_tagged)))
+    table.add_row("Verified, not in CheckMK", str(len(report.checkmk_gap_verified)))
+    table.add_row("Phantom suspects (ping only)", str(len(report.phantom_hosts)))
+    output_console.print(table)
+
+
+def render_stale_policy_summary(summary: StalePolicySummary, *, console: Console | None = None) -> None:
+    output_console = console or Console()
+    table = Table(title="Stale IP Policy")
+    table.add_column("Metric", no_wrap=True)
+    table.add_column("Count", justify="right")
+    table.add_row("Tagged IPs examined", str(summary.examined))
+    table.add_row("Would delete", str(summary.would_delete))
+    table.add_row("Deleted", str(summary.deleted))
+    table.add_row("Skipped (assigned to device)", str(summary.skipped_assigned))
+    table.add_row("Skipped (in CheckMK)", str(summary.skipped_checkmk))
+    output_console.print(table)
+    if summary.actions:
+        detail = Table(title="Stale actions (sample)")
+        detail.add_column("IP")
+        detail.add_column("Miss count")
+        detail.add_column("Action")
+        detail.add_column("Reason")
+        for action in summary.actions[:50]:
+            detail.add_row(action.ip, str(action.miss_count), action.action, action.reason)
+        if len(summary.actions) > 50:
+            detail.add_row("…", "", "", f"({len(summary.actions) - 50} more)")
+        output_console.print(detail)
+
+
+def _run_reverify_tagged(
+    *,
+    config_path: str | None,
+    dry_run: bool,
+    auto_confirm: bool,
+) -> None:
+    config = load_config(config_path)
+    validate_config(config)
+    configure_logging(config.logging)
+    client = NetBoxClient(
+        config.netbox.base_url,
+        config.netbox.api_token,
+        timeout=config.netbox.timeout,
+        rate_limit=config.netbox.rate_limit,
+    )
+    client.verify_authentication()
+    scanner = NetworkScanner(
+        config=config,
+        netbox_client=client,
+        checkmk_client=CheckMKClient(config.checkmk) if config.checkmk.enabled else None,
+    )
+    summary = run_reverify_tagged(scanner, dry_run=dry_run, auto_confirm=auto_confirm)
+    _log_summary(summary)
+    console.print(f"Re-verified {summary.verified} of {summary.total_hosts} tagged IPs.")
+
+
+def _run_stale_policy(
+    *,
+    config_path: str | None,
+    apply_deletes: bool,
+) -> None:
+    config = load_config(config_path)
+    validate_config(config)
+    configure_logging(config.logging)
+    client = NetBoxClient(
+        config.netbox.base_url,
+        config.netbox.api_token,
+        timeout=config.netbox.timeout,
+        rate_limit=config.netbox.rate_limit,
+    )
+    client.verify_authentication()
+    checkmk = CheckMKClient(config.checkmk) if config.checkmk.enabled else None
+    stale = config.scanner.behavior.stale
+    summary = process_global_stale_deletes(
+        client,
+        checkmk,
+        stale_config=stale,
+        field_slugs=config.scanner.behavior.metadata_fields,
+        apply_deletes=apply_deletes,
+    )
+    render_stale_policy_summary(summary, console=console)
+
+
 def _run_scan(
     *,
     config_path: str | None,
@@ -671,12 +899,22 @@ def _run_scan(
     max_hosts: int | None,
     interactive: bool,
     scheduled: bool,
+    sync_checkmk_dns: bool = False,
+    resume: bool = False,
+    gap_report: bool = False,
+    stale_report: bool = False,
+    apply_stale_deletes: bool = False,
 ) -> None:
     if interactive:
         _clear_interactive_console()
 
     config = load_config(config_path)
     validate_config(config)
+    _validate_checkmk_dns_flags(
+        config,
+        sync_checkmk_dns=sync_checkmk_dns,
+        backfill_checkmk_dns=False,
+    )
     try:
         with run_lock(config.scanner.lock_file):
             _run_scan_locked(
@@ -696,6 +934,11 @@ def _run_scan(
                 max_hosts=max_hosts,
                 interactive=interactive,
                 scheduled=scheduled,
+                sync_checkmk_dns=sync_checkmk_dns,
+                resume=resume,
+                gap_report=gap_report,
+                stale_report=stale_report,
+                apply_stale_deletes=apply_stale_deletes,
             )
     except RunLockError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -719,6 +962,11 @@ def _run_scan_locked(
     max_hosts: int | None,
     interactive: bool,
     scheduled: bool,
+    sync_checkmk_dns: bool = False,
+    resume: bool = False,
+    gap_report: bool = False,
+    stale_report: bool = False,
+    apply_stale_deletes: bool = False,
 ) -> None:
     configure_logging(config.logging, console=not interactive)
     chosen_profile = profile or config.scanner.default_profile
@@ -779,6 +1027,7 @@ def _run_scan_locked(
         interactive=interactive,
         scheduled=scheduled,
         host_count_label=host_count_label,
+        sync_checkmk_dns=sync_checkmk_dns,
         console=console,
     )
     log_run_configuration(
@@ -865,6 +1114,9 @@ def _run_scan_locked(
                 **run_kwargs,
                 approval_callback=_confirm_write if confirm else None,
                 progress_callback=progress_callback,
+                sync_checkmk_dns=sync_checkmk_dns,
+                resume=resume,
+                gap_report_enabled=gap_report,
             )
     else:
 
@@ -875,6 +1127,9 @@ def _run_scan_locked(
             **run_kwargs,
             approval_callback=None,
             progress_callback=progress_callback,
+            sync_checkmk_dns=sync_checkmk_dns,
+            resume=resume,
+            gap_report_enabled=gap_report,
         )
 
     _log_summary(summary)
@@ -883,14 +1138,39 @@ def _run_scan_locked(
         export_results(summary, output)
         LOGGER.info("Wrote scan results to %s", output)
 
+    if summary.gap_report is not None:
+        render_gap_report(summary.gap_report, console=console)
+
+    if stale_report or apply_stale_deletes:
+        stale_summary = process_global_stale_deletes(
+            client,
+            scanner.checkmk_client,
+            stale_config=config.scanner.behavior.stale,
+            field_slugs=config.scanner.behavior.metadata_fields,
+            apply_deletes=apply_stale_deletes and not dry_run,
+        )
+        render_stale_policy_summary(stale_summary, console=console)
+
     if interactive:
         _render_summary(summary)
         if dry_run or summary.netbox_drift or summary.ping_only:
             _render_planned_writes(summary)
 
 
-@click.command()
-@click.option("--config", "config_path", type=click.Path(dir_okay=False, path_type=str))
+@click.command(
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help=(
+        "NetBox IPAM scanner: discover live hosts, optional CheckMK/DNS enrichment, "
+        "lifecycle metadata, stale policy, and global re-verify. "
+        "Full documentation: README.md in the project root."
+    ),
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False, path_type=str),
+    help="YAML config file (else ~/.netbox-scanner.conf or ./config.yaml).",
+)
 @click.option("--ranges", "ranges", multiple=True, help="Legacy: NetBox IP Range name. Repeatable.")
 @click.option("--prefix", "prefixes", multiple=True, help="Prefix CIDR to scan. Repeatable.")
 @click.option("--skip-range", "skip_range_flags", multiple=True, help="IP range name to skip. Repeatable.")
@@ -903,12 +1183,46 @@ def _run_scan_locked(
     help="nmap timing aggressiveness.",
 )
 @click.option("--dry-run", is_flag=True, help="Show planned NetBox writes without writing them.")
+@click.option(
+    "--sync-checkmk-dns",
+    is_flag=True,
+    help="During scan: set NetBox dns_name from CheckMK when PTR and existing dns_name are empty.",
+)
+@click.option(
+    "--backfill-checkmk-dns",
+    is_flag=True,
+    help="No scan: backfill dns_name on tagged NetBox IPs from CheckMK (supports --dry-run).",
+)
 @click.option("--exclude-file", type=click.Path(exists=True, dir_okay=False, path_type=str))
 @click.option("--output", type=click.Path(dir_okay=False, path_type=str))
 @click.option("--confirm/--no-confirm", default=False, help="Interactively confirm each NetBox write.")
 @click.option("--auto-confirm/--no-auto-confirm", default=True, help="Write verified hosts to NetBox without prompts.")
 @click.option("--max-hosts", type=int, default=None, help="Abort if deduplicated target count exceeds this limit.")
 @click.option("--schedule", type=str, help="Cron expression for scheduled runs.")
+@click.option("--resume", is_flag=True, help="Resume from per-prefix checkpoint file.")
+@click.option("--gap-report", is_flag=True, help="After scan, print coverage/gap summary.")
+@click.option(
+    "--reverify-tagged",
+    is_flag=True,
+    help="No prefix scan: ping/PTR-only reverification of all netbox-scanner tagged IPs.",
+)
+@click.option(
+    "--stale-report",
+    is_flag=True,
+    help=(
+        "Stale policy on all scope-tagged IPs (global). Alone: report only unless "
+        "--apply-stale-deletes. After scan: runs post-scan. See README stale section."
+    ),
+)
+@click.option(
+    "--apply-stale-deletes",
+    is_flag=True,
+    help=(
+        "Delete eligible stale IPs (miss count >= threshold, unassigned, not in CheckMK). "
+        "Honors stale.dry_run_deletes when --apply-stale-deletes is omitted. "
+        "Never deletes when --dry-run is set."
+    ),
+)
 def main(
     config_path: str | None,
     ranges: tuple[str, ...],
@@ -918,13 +1232,44 @@ def main(
     profile: str | None,
     speed: str | None,
     dry_run: bool,
+    sync_checkmk_dns: bool,
+    backfill_checkmk_dns: bool,
     exclude_file: str | None,
     output: str | None,
     confirm: bool,
     auto_confirm: bool,
     max_hosts: int | None,
     schedule: str | None,
+    resume: bool,
+    gap_report: bool,
+    reverify_tagged: bool,
+    stale_report: bool,
+    apply_stale_deletes: bool,
 ) -> None:
+    if sync_checkmk_dns and backfill_checkmk_dns:
+        raise click.UsageError(
+            "Use only one of --sync-checkmk-dns and --backfill-checkmk-dns, not both."
+        )
+    if backfill_checkmk_dns:
+        if schedule:
+            raise click.UsageError("--backfill-checkmk-dns cannot be used with --schedule.")
+        _run_checkmk_dns_backfill(config_path=config_path, dry_run=dry_run)
+        return
+    if reverify_tagged:
+        if schedule or ranges or prefixes:
+            raise click.UsageError("--reverify-tagged runs alone (no --prefix/--ranges/--schedule).")
+        _run_reverify_tagged(
+            config_path=config_path,
+            dry_run=dry_run,
+            auto_confirm=auto_confirm,
+        )
+        return
+    if stale_report and not ranges and not prefixes and not schedule:
+        _run_stale_policy(
+            config_path=config_path,
+            apply_deletes=apply_stale_deletes and not dry_run,
+        )
+        return
     if schedule and confirm:
         raise click.UsageError(
             "--confirm is not supported with --schedule. Use --auto-confirm for unattended NetBox writes."
@@ -952,6 +1297,11 @@ def main(
         max_hosts=max_hosts,
         interactive=schedule is None,
         scheduled=schedule is not None,
+        sync_checkmk_dns=sync_checkmk_dns,
+        resume=resume,
+        gap_report=gap_report,
+        stale_report=stale_report,
+        apply_stale_deletes=apply_stale_deletes,
     )
     if schedule:
         run_on_schedule(schedule, runner)

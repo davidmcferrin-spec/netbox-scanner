@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from netbox_scanner.checkmk import CheckMKClient, CheckMKConfig, CheckMKLookupResult
-from netbox_scanner.checkmk import CheckMKClient, CheckMKConfig, CheckMKLookupResult
 from netbox_scanner.config import AppConfig, DNSConfig, NetBoxConfig, ScannerConfig
 from netbox_scanner.dns_verify import DNSLookupResult
 from netbox_scanner.netbox import IpAddressWriteResult, RangeRecord
@@ -245,8 +244,68 @@ class ScannerRunTests(unittest.TestCase):
             hostname="host.example.com",
             apply_checkmk_tag=True,
             checkmk_tag_slug="checkmk",
+            apply_verified_tag=True,
+            verified_tag_slug="netbox-scanner",
             discovery=None,
         )
+
+    def test_run_syncs_checkmk_dns_without_ptr(self):
+        self.config.checkmk = CheckMKConfig(enabled=True, tag_slug="checkmk")
+        checkmk_client = MagicMock(spec=CheckMKClient)
+        checkmk_client.lookup_host_by_ip.return_value = CheckMKLookupResult(
+            monitored=True,
+            host_name="cmk-only.example.com",
+        )
+        nmap_scanner = MagicMock()
+        nmap_scanner.scan.return_value = self._verified_nmap_response("10.0.0.1")
+        scanner = NetworkScanner(
+            config=self.config,
+            netbox_client=self.netbox_client,
+            checkmk_client=checkmk_client,
+            ping_runner=lambda ip: ip == "10.0.0.1",
+            nmap_scanner=nmap_scanner,
+        )
+
+        dns_result = DNSLookupResult(ip="10.0.0.1", ptr_hostname=None, reason="ptr_missing")
+        peek_result = IpAddressWriteResult(
+            status="tag_update",
+            payload={"address": "10.0.0.1/32", "status": "active"},
+            netbox_dns_name=None,
+            update_payload={"id": 1, "tags": [{"slug": "checkmk"}]},
+        )
+        write_eval = IpAddressWriteResult(
+            status="drift",
+            payload={
+                "address": "10.0.0.1/32",
+                "status": "active",
+                "dns_name": "cmk-only.example.com",
+            },
+            netbox_dns_name=None,
+            update_payload={"id": 1, "dns_name": "cmk-only.example.com"},
+        )
+        self.netbox_client.evaluate_ip_address.side_effect = [peek_result, write_eval]
+        self.netbox_client.upsert_ip_address.return_value = IpAddressWriteResult(
+            status="updated",
+            payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "cmk-only.example.com"},
+        )
+
+        with patch("netbox_scanner.scanner.lookup_dns", return_value=dns_result):
+            summary = scanner.run(
+                range_names=["lab"],
+                profile="services",
+                speed="polite",
+                sync_checkmk_dns=True,
+            )
+
+        verified = [result for result in summary.results if result.liveness == "verified"][0]
+        self.assertTrue(verified.checkmk_dns_synced)
+        self.assertEqual("cmk-only.example.com", verified.checkmk_host_name)
+        self.assertEqual(2, self.netbox_client.evaluate_ip_address.call_count)
+        final_call = self.netbox_client.evaluate_ip_address.call_args_list[-1]
+        self.assertEqual("cmk-only.example.com", final_call.kwargs.get("hostname") or final_call.args[1])
+        self.assertIsNone(final_call.kwargs.get("discovery"))
+        upsert_call = self.netbox_client.upsert_ip_address.call_args
+        self.assertEqual("cmk-only.example.com", upsert_call.kwargs.get("hostname") or upsert_call.args[1])
 
     def test_run_updates_when_verified_and_dns_drift(self):
         nmap_scanner = MagicMock()
