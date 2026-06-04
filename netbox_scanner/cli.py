@@ -228,7 +228,11 @@ def render_run_configuration(
     table.add_row("Verified tag slug", config.scanner.verified_tag_slug)
     behavior = config.scanner.behavior
     table.add_row("Fast path (existing NetBox)", "yes" if behavior.fast_path_existing_netbox else "no")
-    table.add_row("Parallel nmap workers", str(behavior.parallel_workers))
+    table.add_row("Nmap mode", behavior.nmap_mode)
+    if behavior.nmap_mode == "batch":
+        table.add_row("Parallel nmap workers", str(behavior.parallel_workers))
+    else:
+        table.add_row("Parallel host workers", str(behavior.parallel_workers))
     table.add_row("Stale miss threshold", str(behavior.stale.miss_threshold))
     table.add_row("CheckMK", "enabled" if config.checkmk.enabled else "disabled")
     if config.checkmk.enabled:
@@ -1085,12 +1089,27 @@ def _run_scan_locked(
             task_id = progress.add_task(
                 "scan",
                 total=1,
-                current_ip="waiting",
+                current_ip="starting…",
                 verified=0,
                 phantom=0,
                 excluded=0,
                 drift=0,
             )
+
+            def _update_progress_bar(summary, *, current_ip: str) -> None:
+                progress.update(
+                    task_id,
+                    total=max(summary.total_hosts, 1),
+                    completed=summary.hosts_completed,
+                    current_ip=current_ip,
+                    verified=summary.verified,
+                    phantom=summary.ping_only,
+                    excluded=summary.excluded,
+                    drift=summary.netbox_drift,
+                )
+
+            def host_started_callback(summary, ip: str) -> None:
+                _update_progress_bar(summary, current_ip=ip)
 
             def progress_callback(summary, result):
                 report_verified_find(
@@ -1099,21 +1118,13 @@ def _run_scan_locked(
                     logger=LOGGER,
                     progress=progress,
                 )
-                progress.update(
-                    task_id,
-                    total=max(summary.total_hosts, 1),
-                    completed=summary.hosts_completed,
-                    current_ip=result.ip,
-                    verified=summary.verified,
-                    phantom=summary.ping_only,
-                    excluded=summary.excluded,
-                    drift=summary.netbox_drift,
-                )
+                _update_progress_bar(summary, current_ip=result.ip)
 
             summary = scanner.run(
                 **run_kwargs,
                 approval_callback=_confirm_write if confirm else None,
                 progress_callback=progress_callback,
+                host_started_callback=host_started_callback,
                 sync_checkmk_dns=sync_checkmk_dns,
                 resume=resume,
                 gap_report_enabled=gap_report,

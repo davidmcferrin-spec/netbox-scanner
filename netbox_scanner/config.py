@@ -169,6 +169,7 @@ def load_config(path: str | None = None) -> AppConfig:
     )
     behavior = ScannerBehaviorConfig(
         fast_path_existing_netbox=bool(scanner.get("fast_path_existing_netbox", True)),
+        nmap_mode=str(scanner.get("nmap_mode", "sequential")).strip().lower(),
         parallel_workers=max(1, min(int(scanner.get("parallel_workers", 4)), 16)),
         nmap_batch_prefixlen=int(scanner.get("nmap_batch_prefixlen", 24)),
         checkpoint_path=str(scanner.get("checkpoint_path", "")),
@@ -228,7 +229,10 @@ def load_config(path: str | None = None) -> AppConfig:
 
 
 def validate_scanner_behavior(config: AppConfig) -> None:
-    workers = config.scanner.behavior.parallel_workers
+    behavior = config.scanner.behavior
+    if behavior.nmap_mode not in ("sequential", "batch"):
+        raise ValueError('scanner.nmap_mode must be "sequential" or "batch".')
+    workers = behavior.parallel_workers
     if workers < 1 or workers > 16:
         raise ValueError("scanner.parallel_workers must be between 1 and 16.")
 

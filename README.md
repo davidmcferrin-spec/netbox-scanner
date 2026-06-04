@@ -38,7 +38,7 @@ Use **`python -m netbox_scanner.cli`** or the installed entry point **`netbox-sc
 - **Exclusions**: NetBox reserved/excluded ranges, `skip_ranges` (by range name), `skip_roles` (by range role, e.g. DHCP Pool), and `--exclude-file`.
 - **Deduplicated targets** across overlapping ranges; **numeric IPv4 scan order** (A.B.C.D) across and within prefixes.
 - **Two-tier verification**:
-  - **New IPs** (not yet in NetBox for that prefix): ICMP ping, then nmap (batched by subnet, parallel workers).
+  - **New IPs** (not yet in NetBox for that prefix): ICMP ping, then per-host nmap (default **`scanner.nmap_mode: sequential`** with live progress; optional **`batch`** for upfront `/24` scans).
   - **Existing NetBox IPs** (fast path): ICMP ping and/or PTR only — no port scan when `scanner.fast_path_existing_netbox` is true.
 - **Liveness states**: `verified`, `ping_only` (phantom suspect), `unreachable`, `excluded`.
 - **DNS** (PTR, forward A/CNAME) for reporting and `dns_name`; PTR wins for writes; never blocks liveness.
@@ -209,7 +209,8 @@ Targets are ordered by numeric IPv4 (A.B.C.D) across selected prefix CIDRs and w
 
 ### Concurrency
 
-- **New hosts**: nmap runs in **batches per subnet** (`scanner.nmap_batch_prefixlen`, default `/24`) with `scanner.parallel_workers` (default 4, max 16).
+- **Default (`scanner.nmap_mode: sequential`)**: each host is scanned individually; up to `scanner.parallel_workers` hosts (default 4) run in parallel; the interactive UI shows `current_ip` when each host **starts** and updates counts when it **finishes**.
+- **Batch mode (`scanner.nmap_mode: batch`)**: new hosts are nmapped in **upfront `/24` batches** (`scanner.nmap_batch_prefixlen`) before per-host processing (faster bulk scans, poor live progress).
 - **Existing hosts**: fast path is per-host ping/DNS (lightweight).
 
 ---
@@ -292,8 +293,9 @@ python -m netbox_scanner.cli --backfill-checkmk-dns --dry-run
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `scanner.fast_path_existing_netbox` | `true` | Skip nmap when IP already in NetBox for prefix |
-| `scanner.parallel_workers` | `4` | Concurrent nmap subnet batches (1–16) |
-| `scanner.nmap_batch_prefixlen` | `24` | Group new hosts for batched nmap |
+| `scanner.nmap_mode` | `sequential` | `sequential` = per-host progress; `batch` = upfront `/24` nmap |
+| `scanner.parallel_workers` | `4` | Sequential: concurrent hosts; batch: concurrent `/24` scans (1–16) |
+| `scanner.nmap_batch_prefixlen` | `24` | **batch** mode only: subnet size for grouped nmap |
 | `scanner.scan_rate_limit` | `0.5` | Seconds between nmap operations (per host or batch) |
 | `scanner.ping_timeout` | `1` | ICMP timeout (seconds) |
 | `scanner.checkpoint_path` | `""` → `~/.netbox-scanner-checkpoint.json` | Per-prefix progress for `--resume` |
@@ -579,4 +581,5 @@ python -m unittest discover -s tests -v
 | Stale never deletes | Need `--apply-stale-deletes` (and not `--dry-run`); assigned or CheckMK exempt; miss count &lt; threshold; or `stale.dry_run_deletes: true` without `--apply-stale-deletes` |
 | Stale deletes unexpectedly | `stale.dry_run_deletes: false` deletes on report-only; set `true` or always use `--dry-run` first |
 | Resume skips everything | Checkpoint marks prefixes complete; delete checkpoint file to restart |
-| Slow huge scans | Enable fast path; tune `parallel_workers`; use `--resume` |
+| Progress stuck on waiting/starting | Old batch mode; ensure `scanner.nmap_mode: sequential` (default) |
+| Slow huge scans | Enable fast path; tune `parallel_workers`; use `--resume`; avoid `batch` unless unattended |

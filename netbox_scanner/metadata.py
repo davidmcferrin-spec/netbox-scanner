@@ -35,6 +35,9 @@ class StalePolicyConfig:
 @dataclass(slots=True)
 class ScannerBehaviorConfig:
     fast_path_existing_netbox: bool = True
+    # sequential: per-host ping/nmap with live progress; parallel_workers hosts at once.
+    # batch: upfront /24 nmap batches (faster, no per-host progress until batch completes).
+    nmap_mode: str = "sequential"
     parallel_workers: int = 4
     nmap_batch_prefixlen: int = 24
     checkpoint_path: str = ""

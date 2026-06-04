@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from netbox_scanner.checkmk import CheckMKClient, CheckMKConfig, CheckMKLookupResult
-from netbox_scanner.config import AppConfig, DNSConfig, NetBoxConfig, ScannerConfig
+from netbox_scanner.config import AppConfig, DNSConfig, NetBoxConfig, ScannerConfig, validate_scanner_behavior
+from netbox_scanner.metadata import ScannerBehaviorConfig
 from netbox_scanner.dns_verify import DNSLookupResult
 from netbox_scanner.netbox import IpAddressWriteResult, RangeRecord
 from netbox_scanner.scanner import (
@@ -463,6 +464,56 @@ class ScannerRunTests(unittest.TestCase):
             self.assertEqual("verified", payload[0]["liveness"])
             self.assertIn("ptr_hostname", payload[0])
             self.assertIn("ptr_hostname", csv_path.read_text(encoding="utf-8"))
+
+    def test_sequential_mode_skips_batch_nmap(self):
+        self.config.scanner.behavior = ScannerBehaviorConfig(nmap_mode="sequential")
+        nmap_scanner = MagicMock()
+        nmap_scanner.scan.return_value = self._verified_nmap_response("10.0.0.1")
+        scanner = self._make_scanner(lambda ip: ip == "10.0.0.1", nmap_scanner)
+        dns_result = DNSLookupResult(ip="10.0.0.1", ptr_hostname="host.example.com", reason="lookup_ok")
+        self.netbox_client.evaluate_ip_address.return_value = IpAddressWriteResult(
+            status="not_found",
+            payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "host.example.com"},
+        )
+
+        started: list[str] = []
+
+        def on_start(summary, ip):
+            started.append(ip)
+
+        with patch("netbox_scanner.scanner.batch_nmap_scan") as batch, patch(
+            "netbox_scanner.scanner.lookup_dns",
+            return_value=dns_result,
+        ):
+            scanner.run(
+                range_names=["lab"],
+                profile="services",
+                speed="polite",
+                dry_run=True,
+                host_started_callback=on_start,
+            )
+            batch.assert_not_called()
+
+        self.assertEqual(["10.0.0.1", "10.0.0.2"], started)
+
+    def test_batch_mode_uses_batch_nmap(self):
+        self.config.scanner.behavior = ScannerBehaviorConfig(nmap_mode="batch", parallel_workers=2)
+        nmap_scanner = MagicMock()
+        nmap_scanner.scan.return_value = self._verified_nmap_response("10.0.0.1")
+        scanner = self._make_scanner(lambda ip: ip == "10.0.0.1", nmap_scanner)
+        dns_result = DNSLookupResult(ip="10.0.0.1", ptr_hostname=None, reason="ptr_missing")
+
+        with patch("netbox_scanner.scanner.batch_nmap_scan", return_value={"10.0.0.1": (True, [22])}) as batch, patch(
+            "netbox_scanner.scanner.lookup_dns",
+            return_value=dns_result,
+        ):
+            scanner.run(range_names=["lab"], profile="services", speed="polite", dry_run=True)
+            batch.assert_called_once()
+
+    def test_validate_scanner_behavior_rejects_unknown_nmap_mode(self):
+        self.config.scanner.behavior = ScannerBehaviorConfig(nmap_mode="invalid")
+        with self.assertRaisesRegex(ValueError, "nmap_mode"):
+            validate_scanner_behavior(self.config)
 
     def test_export_results_rejects_unknown_suffix(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

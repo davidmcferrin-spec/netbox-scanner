@@ -7,9 +7,11 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import asdict, dataclass, field
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -210,6 +212,12 @@ class NetworkScanner:
         self._nmap_scanner = nmap_scanner
         self.ping_runner = ping_runner or self._ping_host
         self.logger = logger or LOGGER
+        self._nmap_lock = threading.Lock()
+        self._summary_lock = threading.Lock()
+
+    def _bump_summary(self, summary: ScanSummary, field: str, amount: int = 1) -> None:
+        with self._summary_lock:
+            setattr(summary, field, getattr(summary, field) + amount)
 
     @property
     def nmap_scanner(self):
@@ -235,20 +243,23 @@ class NetworkScanner:
         return completed.returncode == 0
 
     def _scan_host(self, ip: str, profile: str, speed: str) -> tuple[bool, list[int]]:
-        profile_items = self.config.scanner.profiles[profile]
-        ports = ",".join(item for item in profile_items if not item.startswith("-")) or None
-        arguments = " ".join([timing_for_speed(speed), *[item for item in profile_items if item.startswith("-")]]).strip()
-        if self.config.scanner.scan_rate_limit > 0:
-            time.sleep(self.config.scanner.scan_rate_limit)
-        scan_result = self.nmap_scanner.scan(hosts=ip, ports=ports, arguments=arguments)
-        host_data = scan_result.get("scan", {}).get(ip, {})
-        nmap_up = host_data.get("status", {}).get("state") == "up"
-        open_ports: list[int] = []
-        for proto in ("tcp", "udp"):
-            for port, port_data in host_data.get(proto, {}).items():
-                if port_data.get("state") == "open":
-                    open_ports.append(int(port))
-        return nmap_up, sorted(open_ports)
+        with self._nmap_lock:
+            profile_items = self.config.scanner.profiles[profile]
+            ports = ",".join(item for item in profile_items if not item.startswith("-")) or None
+            arguments = " ".join(
+                [timing_for_speed(speed), *[item for item in profile_items if item.startswith("-")]]
+            ).strip()
+            if self.config.scanner.scan_rate_limit > 0:
+                time.sleep(self.config.scanner.scan_rate_limit)
+            scan_result = self.nmap_scanner.scan(hosts=ip, ports=ports, arguments=arguments)
+            host_data = scan_result.get("scan", {}).get(ip, {})
+            nmap_up = host_data.get("status", {}).get("state") == "up"
+            open_ports: list[int] = []
+            for proto in ("tcp", "udp"):
+                for port, port_data in host_data.get(proto, {}).items():
+                    if port_data.get("state") == "open":
+                        open_ports.append(int(port))
+            return nmap_up, sorted(open_ports)
 
     def _scan_network(
         self,
@@ -258,25 +269,26 @@ class NetworkScanner:
         *,
         expected_ips: set[str],
     ) -> dict[str, tuple[bool, list[int]]]:
-        profile_items = self.config.scanner.profiles[profile]
-        ports = ",".join(item for item in profile_items if not item.startswith("-")) or None
-        arguments = " ".join(
-            [timing_for_speed(speed), *[item for item in profile_items if item.startswith("-")]]
-        ).strip()
-        if self.config.scanner.scan_rate_limit > 0:
-            time.sleep(self.config.scanner.scan_rate_limit)
-        scan_result = self.nmap_scanner.scan(hosts=cidr, ports=ports, arguments=arguments)
-        results: dict[str, tuple[bool, list[int]]] = {}
-        for ip in expected_ips:
-            host_data = scan_result.get("scan", {}).get(ip, {})
-            nmap_up = host_data.get("status", {}).get("state") == "up"
-            open_ports: list[int] = []
-            for proto in ("tcp", "udp"):
-                for port, port_data in host_data.get(proto, {}).items():
-                    if port_data.get("state") == "open":
-                        open_ports.append(int(port))
-            results[ip] = (nmap_up, sorted(open_ports))
-        return results
+        with self._nmap_lock:
+            profile_items = self.config.scanner.profiles[profile]
+            ports = ",".join(item for item in profile_items if not item.startswith("-")) or None
+            arguments = " ".join(
+                [timing_for_speed(speed), *[item for item in profile_items if item.startswith("-")]]
+            ).strip()
+            if self.config.scanner.scan_rate_limit > 0:
+                time.sleep(self.config.scanner.scan_rate_limit)
+            scan_result = self.nmap_scanner.scan(hosts=cidr, ports=ports, arguments=arguments)
+            results: dict[str, tuple[bool, list[int]]] = {}
+            for ip in expected_ips:
+                host_data = scan_result.get("scan", {}).get(ip, {})
+                nmap_up = host_data.get("status", {}).get("state") == "up"
+                open_ports: list[int] = []
+                for proto in ("tcp", "udp"):
+                    for port, port_data in host_data.get(proto, {}).items():
+                        if port_data.get("state") == "open":
+                            open_ports.append(int(port))
+                results[ip] = (nmap_up, sorted(open_ports))
+            return results
 
     def _build_drift_description(self, existing: Any, result: ScanResult) -> str | None:
         netbox_dns = record_dns_name(existing) or None
@@ -310,7 +322,7 @@ class NetworkScanner:
         result.forward_has_a_or_cname = dns_result.forward_has_a_or_cname
         result.forward_addresses = dns_result.forward_addresses
         if dns_result.ptr_hostname:
-            summary.ptr_found += 1
+            self._bump_summary(summary, "ptr_found")
 
     def _apply_checkmk_lookup(self, result: ScanResult) -> None:
         if not self.config.checkmk.enabled or self.checkmk_client is None:
@@ -325,8 +337,9 @@ class NetworkScanner:
         result: ScanResult,
         progress_callback: Callable[[ScanSummary, ScanResult], None] | None,
     ) -> None:
-        summary.hosts_completed += 1
-        summary.results.append(result)
+        with self._summary_lock:
+            summary.hosts_completed += 1
+            summary.results.append(result)
         if progress_callback:
             progress_callback(summary, result)
 
@@ -371,8 +384,8 @@ class NetworkScanner:
     ) -> None:
         result.fast_path = True
         result.liveness = "verified"
-        summary.verified += 1
-        summary.fast_path_verified += 1
+        self._bump_summary(summary, "verified")
+        self._bump_summary(summary, "fast_path_verified")
         self._apply_checkmk_lookup(result)
         behavior = self.config.scanner.behavior
         slugs = behavior.metadata_fields
@@ -457,7 +470,7 @@ class NetworkScanner:
     ) -> ScanResult:
         if is_excluded(ip, exclusions):
             result = ScanResult(ip=ip, liveness="unreachable", excluded=True, reason="excluded")
-            summary.excluded += 1
+            self._bump_summary(summary, "excluded")
             return result
 
         behavior = self.config.scanner.behavior
@@ -480,7 +493,7 @@ class NetworkScanner:
                 )
             else:
                 result.liveness = "unreachable"
-                summary.unreachable += 1
+                self._bump_summary(summary, "unreachable")
                 self._handle_fast_path_miss(
                     ip=ip,
                     existing=existing,
@@ -494,7 +507,7 @@ class NetworkScanner:
         if not ping_ok:
             result.liveness = "unreachable"
             result.reason = "ping_failed"
-            summary.unreachable += 1
+            self._bump_summary(summary, "unreachable")
             return result
 
         nmap_up = False
@@ -518,7 +531,7 @@ class NetworkScanner:
         self._apply_dns_lookup(result, summary)
 
         if result.liveness == "verified":
-            summary.verified += 1
+            self._bump_summary(summary, "verified")
             self._handle_netbox_write(
                 result=result,
                 summary=summary,
@@ -531,7 +544,7 @@ class NetworkScanner:
             )
             self._apply_post_write_metadata(result, profile)
         else:
-            summary.ping_only += 1
+            self._bump_summary(summary, "ping_only")
             result.reason = "phantom_suspect"
             if existing is not None:
                 self._handle_phantom_tag(
@@ -565,6 +578,115 @@ class NetworkScanner:
             dry_run=False,
         )
 
+    def _scan_target_hosts(
+        self,
+        *,
+        targets: list[str],
+        ip_index: dict[str, Any],
+        exclusions: list,
+        profile: str,
+        speed: str,
+        profile_items: list[str],
+        summary: ScanSummary,
+        dry_run: bool,
+        auto_confirm: bool,
+        approval_callback: Callable[[ScanResult], bool] | None,
+        sync_checkmk_dns: bool,
+        progress_callback: Callable[[ScanSummary, ScanResult], None] | None,
+        host_started_callback: Callable[[ScanSummary, str], None] | None,
+        prefix_state: Any | None = None,
+        checkpoint: ScanCheckpoint | None = None,
+        checkpoint_path: Path | None = None,
+        run_id: str = "",
+    ) -> set[str]:
+        behavior = self.config.scanner.behavior
+        pending = [
+            ip
+            for ip in targets
+            if not (prefix_state and prefix_state.is_ip_done(ip))
+        ]
+        nmap_results: dict[str, tuple[bool, list[int]]] | None = None
+        if behavior.nmap_mode == "batch":
+            new_hosts = [ip for ip in pending if ip not in ip_index]
+            if new_hosts:
+                nmap_results = batch_nmap_scan(
+                    self,
+                    new_hosts,
+                    profile,
+                    speed,
+                    prefixlen=behavior.nmap_batch_prefixlen,
+                    parallel_workers=behavior.parallel_workers,
+                )
+
+        common_kwargs = {
+            "exclusions": exclusions,
+            "profile": profile,
+            "speed": speed,
+            "profile_items": profile_items,
+            "summary": summary,
+            "dry_run": dry_run,
+            "auto_confirm": auto_confirm,
+            "approval_callback": approval_callback,
+            "sync_checkmk_dns": sync_checkmk_dns,
+            "nmap_results": nmap_results,
+            "progress_callback": progress_callback,
+            "host_started_callback": host_started_callback,
+            "prefix_state": prefix_state,
+            "checkpoint": checkpoint,
+            "checkpoint_path": checkpoint_path,
+            "run_id": run_id,
+        }
+
+        workers = 1
+        if approval_callback is None and behavior.nmap_mode == "sequential":
+            workers = max(1, min(behavior.parallel_workers, len(pending) or 1))
+
+        scanned: set[str] = set()
+
+        process_kwargs = {
+            k: v
+            for k, v in common_kwargs.items()
+            if k
+            not in (
+                "host_started_callback",
+                "progress_callback",
+                "prefix_state",
+                "checkpoint",
+                "checkpoint_path",
+                "run_id",
+            )
+        }
+
+        def work(ip: str) -> str:
+            if host_started_callback:
+                host_started_callback(summary, ip)
+            result = self._process_ip(ip=ip, existing=ip_index.get(ip), **process_kwargs)
+            self._finalize_result(summary, result, progress_callback)
+            if prefix_state:
+                with self._summary_lock:
+                    prefix_state.mark_ip(ip)
+                    if checkpoint_path and checkpoint:
+                        checkpoint.run_id = run_id
+                        save_checkpoint(checkpoint_path, checkpoint)
+            return ip
+
+        if workers <= 1:
+            for ip in pending:
+                work(ip)
+                scanned.add(ip)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(work, ip): ip for ip in pending}
+                for future in as_completed(futures):
+                    scanned.add(future.result())
+
+        if prefix_state:
+            with self._summary_lock:
+                prefix_state.mark_complete()
+                if checkpoint_path and checkpoint:
+                    save_checkpoint(checkpoint_path, checkpoint)
+        return scanned
+
     def _run_prefix_scan(
         self,
         *,
@@ -580,6 +702,7 @@ class NetworkScanner:
         approval_callback: Callable[[ScanResult], bool] | None,
         sync_checkmk_dns: bool,
         progress_callback: Callable[[ScanSummary, ScanResult], None] | None,
+        host_started_callback: Callable[[ScanSummary, str], None] | None,
         checkpoint: ScanCheckpoint | None,
         checkpoint_path: Path | None,
         run_id: str,
@@ -591,56 +714,25 @@ class NetworkScanner:
             else {}
         )
         prefix_state = checkpoint.prefix_state(prefix_cidr) if checkpoint else None
-
-        new_hosts = [
-            ip
-            for ip in targets
-            if ip not in ip_index
-            and not (prefix_state and prefix_state.is_ip_done(ip))
-        ]
-        nmap_results: dict[str, tuple[bool, list[int]]] = {}
-        if new_hosts:
-            nmap_results = batch_nmap_scan(
-                self,
-                new_hosts,
-                profile,
-                speed,
-                prefixlen=behavior.nmap_batch_prefixlen,
-                parallel_workers=behavior.parallel_workers,
-            )
-
-        scanned: set[str] = set()
-        for ip in targets:
-            if prefix_state and prefix_state.is_ip_done(ip):
-                continue
-            existing = ip_index.get(ip)
-            result = self._process_ip(
-                ip=ip,
-                existing=existing,
-                exclusions=exclusions,
-                profile=profile,
-                speed=speed,
-                profile_items=profile_items,
-                summary=summary,
-                dry_run=dry_run,
-                auto_confirm=auto_confirm,
-                approval_callback=approval_callback,
-                sync_checkmk_dns=sync_checkmk_dns,
-                nmap_results=nmap_results,
-            )
-            scanned.add(ip)
-            self._finalize_result(summary, result, progress_callback)
-            if prefix_state:
-                prefix_state.mark_ip(ip)
-                if checkpoint_path and checkpoint:
-                    checkpoint.run_id = run_id
-                    save_checkpoint(checkpoint_path, checkpoint)
-
-        if prefix_state:
-            prefix_state.mark_complete()
-            if checkpoint_path and checkpoint:
-                save_checkpoint(checkpoint_path, checkpoint)
-        return scanned
+        return self._scan_target_hosts(
+            targets=targets,
+            ip_index=ip_index,
+            exclusions=exclusions,
+            profile=profile,
+            speed=speed,
+            profile_items=profile_items,
+            summary=summary,
+            dry_run=dry_run,
+            auto_confirm=auto_confirm,
+            approval_callback=approval_callback,
+            sync_checkmk_dns=sync_checkmk_dns,
+            progress_callback=progress_callback,
+            host_started_callback=host_started_callback,
+            prefix_state=prefix_state,
+            checkpoint=checkpoint,
+            checkpoint_path=checkpoint_path,
+            run_id=run_id,
+        )
 
     def run(
         self,
@@ -659,6 +751,7 @@ class NetworkScanner:
         max_hosts: int | None = None,
         approval_callback: Callable[[ScanResult], bool] | None = None,
         progress_callback: Callable[[ScanSummary, ScanResult], None] | None = None,
+        host_started_callback: Callable[[ScanSummary, str], None] | None = None,
         sync_checkmk_dns: bool = False,
         resume: bool = False,
         gap_report_enabled: bool = False,
@@ -722,6 +815,7 @@ class NetworkScanner:
                     approval_callback=approval_callback,
                     sync_checkmk_dns=sync_checkmk_dns,
                     progress_callback=progress_callback,
+                    host_started_callback=host_started_callback,
                     checkpoint=checkpoint,
                     checkpoint_path=checkpoint_path,
                     run_id=run_id,
@@ -741,19 +835,10 @@ class NetworkScanner:
             if not targets:
                 raise ValueError("No scan targets found in the selected NetBox IP ranges.")
             summary = ScanSummary(total_hosts=len(targets))
-            ip_index: dict[str, Any] = {}
-            nmap_results = batch_nmap_scan(
-                self,
-                [ip for ip in targets if ip not in ip_index],
-                profile,
-                speed,
-                prefixlen=behavior.nmap_batch_prefixlen,
-                parallel_workers=behavior.parallel_workers,
-            )
-            for ip in targets:
-                result = self._process_ip(
-                    ip=ip,
-                    existing=ip_index.get(ip),
+            all_scanned.update(
+                self._scan_target_hosts(
+                    targets=targets,
+                    ip_index={},
                     exclusions=exclusions,
                     profile=profile,
                     speed=speed,
@@ -763,10 +848,11 @@ class NetworkScanner:
                     auto_confirm=auto_confirm,
                     approval_callback=approval_callback,
                     sync_checkmk_dns=sync_checkmk_dns,
-                    nmap_results=nmap_results,
+                    progress_callback=progress_callback,
+                    host_started_callback=host_started_callback,
+                    run_id=run_id,
                 )
-                all_scanned.add(ip)
-                self._finalize_result(summary, result, progress_callback)
+            )
 
         if gap_report_enabled:
             tagged_records = self.netbox_client.fetch_ip_addresses_with_tag(
@@ -852,7 +938,7 @@ class NetworkScanner:
         result.netbox_status = evaluation.status
 
         if evaluation.status == "already_exists":
-            summary.netbox_existing += 1
+            self._bump_summary(summary, "netbox_existing")
             if not result.reason:
                 result.reason = "already_exists"
             return
@@ -860,7 +946,7 @@ class NetworkScanner:
         if dry_run:
             if evaluation.status in ("drift", "tag_update"):
                 if evaluation.status == "drift":
-                    summary.netbox_drift += 1
+                    self._bump_summary(summary, "netbox_drift")
                 result.netbox_payload = evaluation.update_payload or evaluation.payload
                 if not result.reason:
                     result.reason = "dry_run"
@@ -900,9 +986,9 @@ class NetworkScanner:
         else:
             result.reason = write_result.status
         if write_result.status == "created":
-            summary.netbox_created += 1
+            self._bump_summary(summary, "netbox_created")
         elif write_result.status == "updated":
-            summary.netbox_updated += 1
+            self._bump_summary(summary, "netbox_updated")
             if evaluation.status == "tag_update" and apply_checkmk_tag:
                 self.logger.info(
                     "Tagged NetBox %s with %r (CheckMK host=%r)",

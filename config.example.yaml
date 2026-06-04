@@ -118,12 +118,18 @@ scanner:
   # false: every IP gets full ping + nmap (slow on large prefixes).
   fast_path_existing_netbox: true
 
-  # --- Parallel nmap (new IPs only) ---
-  # Number of concurrent subnet batch scans (1–16). Default 4.
+  # --- Nmap scan mode ---
+  # sequential (default): per-host ping/nmap; progress bar updates per host;
+  #   parallel_workers hosts processed at once (live current_ip).
+  # batch: upfront /24 nmap batches (faster bulk scans, no per-host progress
+  #   until each prefix batch finishes).
+  nmap_mode: sequential
+
+  # sequential: concurrent hosts (ping/nmap/NetBox) — default 4, max 16.
+  # batch: concurrent /24 nmap batches for new IPs only.
   parallel_workers: 4
 
-  # Group new (non–fast-path) hosts into subnets of this prefix length for
-  # batched nmap (e.g. 24 = /24 batches).
+  # batch mode only: group new hosts into subnets of this prefix length.
   nmap_batch_prefixlen: 24
 
   # --- Checkpoint / --resume ---
