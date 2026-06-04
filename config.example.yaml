@@ -140,7 +140,7 @@ scanner:
   # --- NetBox custom field slugs (IP Address object) ---
   # Create each field in NetBox Extras → Custom Fields before use.
   # Written on successful verify / fast-path refresh / reverify.
-  custom_field_last_verified_at: "last_verified_at"       # text or datetime
+  custom_field_last_verified_at: "last_verified_at"       # NetBox Date/Time: YYYY-MM-DD HH:MM:SS (UTC)
   custom_field_last_verified_profile: "last_verified_profile"  # text
   custom_field_last_open_ports: "last_open_ports"           # text (comma ports)
   custom_field_miss_count: "scanner_miss_count"             # integer

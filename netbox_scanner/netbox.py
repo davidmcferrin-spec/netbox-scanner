@@ -1041,7 +1041,13 @@ def resolve_write_tag_slugs(
 
 
 def scanner_note_timestamp() -> str:
+    """Human-readable UTC timestamp for description lines."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def netbox_custom_field_datetime() -> str:
+    """UTC instant formatted for NetBox Date/Time custom fields (ISO 8601, no timezone suffix)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def truncate_netbox_description(

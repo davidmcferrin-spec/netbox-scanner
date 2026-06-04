@@ -6,7 +6,7 @@ from .netbox import (
     DEFAULT_VERIFIED_TAG_SLUG,
     NO_PTR_DISCOVERY_MARKER,
     PREVIOUS_DNS_NAME_PREFIX,
-    scanner_note_timestamp,
+    netbox_custom_field_datetime,
     upsert_scanner_description_line,
 )
 
@@ -52,7 +52,7 @@ def build_last_verified_custom_fields(
     open_ports: list[int] | None = None,
 ) -> dict[str, str | int]:
     fields: dict[str, str | int] = {
-        slugs.last_verified_at: scanner_note_timestamp(),
+        slugs.last_verified_at: netbox_custom_field_datetime(),
         slugs.last_verified_profile: profile,
     }
     if open_ports is not None:

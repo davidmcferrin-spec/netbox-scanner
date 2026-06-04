@@ -134,7 +134,7 @@ Slugs must match config (`scanner.custom_field_*` or defaults below):
 
 | Slug (default) | Type (suggested) | Purpose |
 |----------------|------------------|---------|
-| `last_verified_at` | Text or Date/Time | UTC timestamp of last successful verify |
+| `last_verified_at` | **Date/Time** (recommended) or Text | UTC time as `YYYY-MM-DD HH:MM:SS` (no `UTC` suffix) |
 | `last_verified_profile` | Text | Profile name (e.g. `services`, `reverify`, `services-fast`) |
 | `last_open_ports` | Text | Comma-separated ports (full scan); `none` on fast path |
 | `scanner_miss_count` | Integer | Consecutive failed ping+PTR checks; reset on success |

@@ -1202,6 +1202,19 @@ class NetBoxTests(unittest.TestCase):
         return RequestError(req)
 
 
+class NetBoxCustomFieldDatetimeTests(unittest.TestCase):
+    def test_netbox_custom_field_datetime_format(self):
+        from netbox_scanner.netbox import netbox_custom_field_datetime
+
+        with patch("netbox_scanner.netbox.datetime") as mock_dt:
+            mock_dt.now.return_value = __import__("datetime").datetime(
+                2026, 6, 4, 14, 16, 18, tzinfo=__import__("datetime").timezone.utc
+            )
+            value = netbox_custom_field_datetime()
+        self.assertEqual("2026-06-04 14:16:18", value)
+        self.assertNotIn("UTC", value)
+
+
 class DescriptionTruncateTests(unittest.TestCase):
     def test_truncate_netbox_description_keeps_tail(self):
         tail = "netbox-scanner: drift: PTR=host.example.com @ 2026-01-01"

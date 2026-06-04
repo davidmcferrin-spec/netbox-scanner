@@ -26,11 +26,16 @@ class MetadataTests(unittest.TestCase):
         self.assertIn("count=3/5", note)
 
     def test_build_last_verified_custom_fields(self):
-        with patch("netbox_scanner.metadata.scanner_note_timestamp", return_value="2026-06-03 12:00:00 UTC"):
+        with patch(
+            "netbox_scanner.metadata.netbox_custom_field_datetime",
+            return_value="2026-06-03 12:00:00",
+        ):
             fields = build_last_verified_custom_fields(
                 MetadataFieldSlugs(),
                 profile="services",
                 open_ports=[22, 80],
             )
+        self.assertEqual("2026-06-03 12:00:00", fields["last_verified_at"])
+        self.assertNotIn("UTC", fields["last_verified_at"])
         self.assertEqual("services", fields["last_verified_profile"])
         self.assertEqual("22,80", fields["last_open_ports"])
