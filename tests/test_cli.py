@@ -9,6 +9,7 @@ from netbox_scanner.config import AppConfig, DNSConfig, NetBoxConfig, ScannerCon
 from netbox_scanner.cli import (
     ResolvedScanTargets,
     _clear_interactive_console,
+    _scan_progress,
     format_verified_find_line,
     main,
     netbox_outcome_label,
@@ -19,15 +20,10 @@ from netbox_scanner.scanner import ScanResult
 
 
 class CliTests(unittest.TestCase):
-    def test_confirm_and_auto_confirm_are_mutually_exclusive(self):
+    def test_confirm_prompts_per_host_even_with_default_auto_confirm(self):
         runner = CliRunner()
-        result = runner.invoke(
-            main,
-            ["--ranges", "lab", "--confirm", "--auto-confirm"],
-        )
-
-        self.assertNotEqual(0, result.exit_code)
-        self.assertIn("not both", result.output)
+        result = runner.invoke(main, ["--ranges", "lab", "--confirm"])
+        self.assertNotIn("Use either --confirm or --auto-confirm", result.output)
 
     def test_schedule_rejects_confirm(self):
         runner = CliRunner()
@@ -115,6 +111,79 @@ class CliTests(unittest.TestCase):
             "would add to NetBox (dry-run, dns_name=dry.example.com)",
             netbox_outcome_label(result),
         )
+
+    def test_format_verified_find_line_truncates_for_narrow_terminal(self):
+        result = ScanResult(
+            ip="10.0.0.1",
+            liveness="verified",
+            open_ports=[22, 443, 8080],
+            ptr_hostname="very-long-hostname-that-overflows-the-line.example.com",
+            netbox_written=True,
+            netbox_status="created",
+            reason="created",
+            netbox_payload={
+                "address": "10.0.0.1/32",
+                "status": "active",
+                "dns_name": "very-long-hostname-that-overflows-the-line.example.com",
+            },
+            forward_addresses=["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+        )
+        line = format_verified_find_line(result, max_width=80)
+        self.assertLessEqual(len(line), 80)
+        self.assertIn("FIND 10.0.0.1", line)
+        self.assertIn("…", line)
+
+    def test_scan_progress_omits_eta_on_narrow_terminal(self):
+        narrow = _scan_progress(Console(file=StringIO(), width=80, force_terminal=False))
+        wide = _scan_progress(Console(file=StringIO(), width=120, force_terminal=False))
+        self.assertEqual(4, len(narrow.columns))
+        self.assertEqual(5, len(wide.columns))
+
+    def test_render_run_configuration_fits_narrow_terminal(self):
+        config = AppConfig(
+            netbox=NetBoxConfig(
+                base_url="https://netbox.example.com",
+                api_token="token",
+            ),
+            scanner=ScannerConfig(default_profile="services", default_speed="polite"),
+        )
+        resolved = ResolvedScanTargets(
+            legacy_ranges=False,
+            selection_source="--prefix",
+            selected_display_prefixes=["10.114.0.0/16"],
+            scan_prefixes=["10.114.50.0/24"],
+            scan_ranges=None,
+            legacy_plan_ranges=None,
+            exclusion_ranges=[],
+            skip_name_set=set(),
+        )
+        buffer = StringIO()
+        console = Console(file=buffer, width=80, force_terminal=True)
+
+        render_run_configuration(
+            config=config,
+            config_path=None,
+            resolved=resolved,
+            profile="services",
+            speed="polite",
+            skip_ranges=[],
+            skip_roles=[],
+            dry_run=True,
+            confirm=False,
+            auto_confirm=False,
+            exclude_file=None,
+            output=None,
+            max_hosts=None,
+            interactive=True,
+            scheduled=False,
+            host_count_label="254",
+            console=console,
+        )
+
+        output = buffer.getvalue()
+        self.assertIn("Run Configuration", output)
+        self.assertIn("prefix", output)
+        self.assertIn("services", output)
 
     def test_render_run_configuration_shows_prefix_mode_and_redacts_token(self):
         config = AppConfig(
@@ -227,6 +296,7 @@ class CliTests(unittest.TestCase):
         summary.ptr_found = 0
         summary.netbox_created = 0
         summary.netbox_existing = 0
+        summary.netbox_updated = 0
         summary.netbox_drift = 0
         summary.results = []
 

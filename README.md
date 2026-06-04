@@ -14,9 +14,9 @@
 - Default `services` profile scans TCP 22, 23, 80, 443, 445 and UDP 161 only
 - Phantom suspect detection for ping-only replies (e.g. switch/router proxy responses)
 - Informational DNS lookup (PTR, A, CNAME) for hostname hints — never blocks writes
-- DNS drift reporting when NetBox `dns_name` differs from PTR (report-only; no updates)
+- DNS drift correction when NetBox `dns_name` differs from PTR (previous name appended to `description`)
+- Verified hosts are written to NetBox by default; use `--no-auto-confirm`, `--confirm`, or `--dry-run` to change behavior
 - Configurable named scan profiles and `--speed` to nmap timing template mapping
-- `--confirm`, `--auto-confirm`, and `--dry-run` write controls
 - `--max-hosts` guardrail for large ranges
 - Rich CLI progress and summary output for ad hoc runs
 - Cron scheduling through APScheduler with file-based logging
@@ -97,7 +97,7 @@ During a run, prefixes and IP ranges are fetched once and cached on the client s
 
 Only one scan may run at a time: the default lock file is `~/.netbox-scanner.lock` (override with `scanner.lock_file`). It is created when a run starts and removed on normal exit, errors, or Ctrl+C; stale locks from crashed processes are replaced automatically.
 
-DNS (PTR, A, CNAME) is collected for reporting and as an optional `dns_name` hint when writing to NetBox. DNS never gates liveness or blocks writes.
+DNS (PTR, A, CNAME) is collected for reporting and as the `dns_name` written to NetBox. DNS never gates liveness or blocks writes. When an existing NetBox `dns_name` differs from PTR, the scanner updates it and appends `Previous dns_name: … (netbox-scanner)` to the IP address `description`.
 
 ## Scan profiles
 
@@ -185,16 +185,22 @@ python -m netbox_scanner.cli --prefix 10.114.50.0/24 --dry-run
 python -m netbox_scanner.cli --ranges "Branch A" --dry-run
 ```
 
+Scan-only (no NetBox writes):
+
+```bash
+python -m netbox_scanner.cli --prefix 10.10.0.0/24 --no-auto-confirm
+```
+
 Interactive confirmation per verified record:
 
 ```bash
 python -m netbox_scanner.cli --prefix 10.10.0.0/24 --confirm
 ```
 
-Batch approval:
+Dry-run (show planned creates/updates without writing):
 
 ```bash
-python -m netbox_scanner.cli --prefix 10.10.0.0/24 --auto-confirm
+python -m netbox_scanner.cli --prefix 10.10.0.0/24 --dry-run
 ```
 
 Exclude additional local addresses or CIDRs:
@@ -218,10 +224,10 @@ python -m netbox_scanner.cli --prefix 10.10.0.0/24 --output results.json
 Schedule recurring runs (uses `scanner.prefixes` from config):
 
 ```bash
-python -m netbox_scanner.cli --schedule "0 2 * * *" --auto-confirm
+python -m netbox_scanner.cli --schedule "0 2 * * *"
 ```
 
-Scheduled runs do not support `--confirm`. Use `--auto-confirm` for unattended NetBox writes.
+Scheduled runs do not support `--confirm`. NetBox writes are enabled by default; use `--no-auto-confirm` or `--dry-run` to disable them.
 
 ## Tests
 

@@ -28,8 +28,7 @@ from .scanner import NetworkScanner, ScanResult, export_results, timing_for_spee
 from .run_lock import RunLockError, run_lock
 from .scheduler import run_on_schedule
 from .selection import prompt_prefix_selection, render_prefix_scan_plan, render_range_plan
-
-_CIDR_PREVIEW_LIMIT = 10
+from .terminal import effective_width, fit_line, format_list_preview, is_narrow
 
 
 LOGGER = logging.getLogger(__name__)
@@ -88,23 +87,18 @@ def _selection_source(
     return "interactive prefix picker"
 
 
-def _format_list_preview(items: list[str], *, limit: int = _CIDR_PREVIEW_LIMIT) -> str:
-    if not items:
-        return "-"
-    if len(items) <= limit:
-        return ", ".join(items)
-    shown = ", ".join(items[:limit])
-    return f"{shown}, ... (+{len(items) - limit} more)"
+def _value_column_width(output_console: Console | None = None) -> int:
+    return max(30, effective_width(output_console) - 22)
 
 
 def _write_mode_label(*, dry_run: bool, confirm: bool, auto_confirm: bool) -> str:
     if dry_run:
         return "dry-run (no NetBox writes)"
-    if auto_confirm:
-        return "auto-confirm (write all verified)"
     if confirm:
         return "confirm each write"
-    return "scan only (no writes unless --confirm or --auto-confirm)"
+    if auto_confirm:
+        return "auto-confirm (write and update verified hosts)"
+    return "scan only (--no-auto-confirm)"
 
 
 def _profile_ports_label(config: AppConfig, profile: str) -> str:
@@ -160,8 +154,9 @@ def render_run_configuration(
     nmap_timing = timing_for_speed(speed)
 
     table = Table(title="Run Configuration")
-    table.add_column("Setting")
-    table.add_column("Value")
+    value_max = _value_column_width(output_console)
+    table.add_column("Setting", no_wrap=True)
+    table.add_column("Value", overflow="fold", max_width=value_max)
 
     table.add_row("Run style", _run_style(interactive=interactive, scheduled=scheduled))
     table.add_row("Config source", _config_source_label(config_path))
@@ -179,15 +174,15 @@ def render_run_configuration(
     table.add_row("Selection source", resolved.selection_source)
     if resolved.legacy_ranges:
         range_names = [record.name for record in resolved.scan_ranges or []]
-        table.add_row("IP ranges to scan", _format_list_preview(range_names))
+        table.add_row("IP ranges to scan", format_list_preview(range_names))
     else:
         table.add_row(
             "Selected prefixes",
-            _format_list_preview(resolved.selected_display_prefixes or []),
+            format_list_preview(resolved.selected_display_prefixes or []),
         )
         table.add_row(
             "Scan prefix CIDRs",
-            _format_list_preview(resolved.scan_prefixes or []),
+            format_list_preview(resolved.scan_prefixes or []),
         )
     table.add_row("Hosts to scan", host_count_label)
 
@@ -204,8 +199,8 @@ def render_run_configuration(
     table.add_row("NetBox HTTP timeout (s)", str(config.netbox.timeout))
     table.add_row("NetBox API delay (s)", str(config.netbox.rate_limit))
 
-    table.add_row("Skip range names", _format_list_preview(skip_ranges))
-    table.add_row("Skip range roles", _format_list_preview(skip_roles))
+    table.add_row("Skip range names", format_list_preview(skip_ranges))
+    table.add_row("Skip range roles", format_list_preview(skip_roles))
     table.add_row("Exclude file", exclude_file or "-")
 
     table.add_row("NetBox writes", _write_mode_label(dry_run=dry_run, confirm=confirm, auto_confirm=auto_confirm))
@@ -272,9 +267,7 @@ def format_dns_hostname_fields(result: ScanResult) -> str:
     ptr = result.ptr_hostname or "-"
     write_dns = netbox_write_dns_name(result) or "-"
     parts = [f"PTR={ptr}", f"dns_name={write_dns}"]
-    if result.netbox_dns_name and result.netbox_status == "drift":
-        parts.append(f"NetBox-dns_name={result.netbox_dns_name}")
-    elif result.netbox_dns_name and result.netbox_status == "already_exists":
+    if result.netbox_dns_name and result.netbox_status in ("drift", "updated", "already_exists"):
         parts.append(f"NetBox-dns_name={result.netbox_dns_name}")
     if result.forward_addresses:
         parts.append(f"forward={','.join(result.forward_addresses)}")
@@ -290,16 +283,26 @@ def netbox_outcome_label(result: ScanResult) -> str:
         if dns_name:
             return f"added to NetBox (dns_name={dns_name})"
         return "added to NetBox (no dns_name)"
+    if result.netbox_written and status == "updated":
+        previous = result.netbox_dns_name or "(none)"
+        if dns_name:
+            return f"updated NetBox (dns_name={dns_name}, was {previous})"
+        return f"updated NetBox (was {previous})"
     if status == "already_exists":
         if result.netbox_dns_name:
             return f"already in NetBox (dns_name={result.netbox_dns_name})"
         return "already in NetBox"
+    if status == "drift" and reason == "dry_run":
+        previous = result.netbox_dns_name or "(none)"
+        if dns_name:
+            return f"would update NetBox (dns_name={dns_name}, was {previous})"
+        return f"would update NetBox (was {previous})"
     if status == "drift":
         if result.netbox_dns_name and result.ptr_hostname:
             return (
-                f"not added (DNS drift: NetBox={result.netbox_dns_name}, PTR={result.ptr_hostname})"
+                f"not updated (DNS drift: NetBox={result.netbox_dns_name}, PTR={result.ptr_hostname})"
             )
-        return "not added (DNS drift — report only)"
+        return "not updated (DNS drift — report only)"
     if status == "planned" and reason == "dry_run":
         if dns_name:
             return f"would add to NetBox (dry-run, dns_name={dns_name})"
@@ -321,11 +324,23 @@ def netbox_outcome_label(result: ScanResult) -> str:
     return "no NetBox action"
 
 
-def format_verified_find_line(result: ScanResult) -> str:
+def format_verified_find_line(result: ScanResult, *, max_width: int | None = None) -> str:
     ports = ",".join(str(port) for port in result.open_ports) or "-"
     dns_fields = format_dns_hostname_fields(result)
     netbox = netbox_outcome_label(result)
-    return f"FIND {result.ip}  {dns_fields}  ports={ports}  NetBox: {netbox}"
+    parts = [f"FIND {result.ip}", dns_fields, f"ports={ports}", f"NetBox: {netbox}"]
+    if max_width is None:
+        return "  ".join(parts)
+    return fit_line(parts, max_width)
+
+
+def _print_find_line(display_line: str, *, output_console: Console) -> None:
+    if "NetBox: " in display_line:
+        head, netbox = display_line.rsplit("NetBox: ", 1)
+        head = head.replace("FIND", "[bold green]FIND[/bold green]", 1)
+        output_console.print(f"{head}NetBox: [cyan]{netbox}[/cyan]")
+        return
+    output_console.print(display_line.replace("FIND", "[bold green]FIND[/bold green]", 1))
 
 
 def report_verified_find(
@@ -337,22 +352,21 @@ def report_verified_find(
 ) -> None:
     if result.liveness != "verified":
         return
-    line = format_verified_find_line(result)
     if logger is not None:
-        logger.info(line)
+        logger.info(format_verified_find_line(result))
     if print_to_console and console is not None:
-        ports = ",".join(str(port) for port in result.open_ports) or "-"
-        dns_fields = format_dns_hostname_fields(result)
-        console.print(
-            f"[bold green]FIND[/bold green] {result.ip}  {dns_fields}  ports={ports}  "
-            f"NetBox: [cyan]{netbox_outcome_label(result)}[/cyan]"
+        display_line = format_verified_find_line(
+            result,
+            max_width=effective_width(console),
         )
+        _print_find_line(display_line, output_console=console)
 
 
 def _render_summary(summary) -> None:
+    value_max = _value_column_width(console)
     table = Table(title="Scan Summary")
-    table.add_column("Metric")
-    table.add_column("Value", justify="right")
+    table.add_column("Metric", no_wrap=True)
+    table.add_column("Value", justify="right", overflow="fold", max_width=value_max)
     table.add_row("Hosts total", str(summary.total_hosts))
     table.add_row("Hosts completed", str(summary.hosts_completed))
     table.add_row("Verified alive", str(summary.verified))
@@ -361,8 +375,9 @@ def _render_summary(summary) -> None:
     table.add_row("Excluded", str(summary.excluded))
     table.add_row("PTR found", str(summary.ptr_found))
     table.add_row("NetBox created", str(summary.netbox_created))
+    table.add_row("NetBox updated", str(summary.netbox_updated))
     table.add_row("NetBox existing", str(summary.netbox_existing))
-    table.add_row("NetBox drift", str(summary.netbox_drift))
+    table.add_row("NetBox drift (dry-run)", str(summary.netbox_drift))
     console.print(table)
 
 
@@ -374,12 +389,13 @@ def _render_planned_writes(summary) -> None:
     ]
     drift = [result for result in summary.results if result.netbox_status == "drift"]
     phantoms = [result for result in summary.results if result.liveness == "ping_only"]
+    value_max = _value_column_width(console)
 
     if phantoms:
         table = Table(title="Phantom Suspects (ping only)")
-        table.add_column("IP")
-        table.add_column("PTR hostname")
-        table.add_column("Open ports")
+        table.add_column("IP", no_wrap=True)
+        table.add_column("PTR hostname", max_width=24, overflow="ellipsis")
+        table.add_column("Open ports", overflow="fold", max_width=value_max)
         for result in phantoms:
             table.add_row(
                 result.ip,
@@ -390,21 +406,50 @@ def _render_planned_writes(summary) -> None:
 
     if planned:
         table = Table(title="Planned NetBox Writes")
-        table.add_column("IP")
-        table.add_column("PTR hostname")
-        table.add_column("Payload")
+        table.add_column("IP", no_wrap=True)
+        table.add_column("PTR hostname", max_width=24, overflow="ellipsis")
+        table.add_column("Payload", overflow="fold", max_width=value_max)
         for result in planned:
             table.add_row(result.ip, result.ptr_hostname or "", str(result.netbox_payload))
         console.print(table)
 
     if drift:
-        table = Table(title="DNS Drift (report only)")
-        table.add_column("IP")
-        table.add_column("PTR hostname")
-        table.add_column("NetBox dns_name")
+        table = Table(title="Planned NetBox Updates (dry-run)")
+        table.add_column("IP", no_wrap=True)
+        table.add_column("PTR hostname", max_width=24, overflow="ellipsis")
+        table.add_column("Payload", overflow="fold", max_width=value_max)
         for result in drift:
-            table.add_row(result.ip, result.ptr_hostname or "", result.netbox_dns_name or "")
+            table.add_row(result.ip, result.ptr_hostname or "", str(result.netbox_payload))
         console.print(table)
+
+
+def _scan_progress(output_console: Console) -> Progress:
+    if is_narrow(output_console):
+        return Progress(
+            TextColumn("{task.fields[current_ip]}", justify="left"),
+            BarColumn(bar_width=20),
+            TextColumn("{task.completed}/{task.total}"),
+            TextColumn(
+                "v={task.fields[verified]} "
+                "p={task.fields[phantom]} "
+                "e={task.fields[excluded]} "
+                "d={task.fields[drift]}"
+            ),
+            console=output_console,
+        )
+    return Progress(
+        TextColumn("{task.fields[current_ip]}", justify="left"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeRemainingColumn(),
+        TextColumn(
+            "verified={task.fields[verified]} "
+            "phantom={task.fields[phantom]} "
+            "excluded={task.fields[excluded]} "
+            "drift={task.fields[drift]}"
+        ),
+        console=output_console,
+    )
 
 
 def _confirm_write(result) -> bool:
@@ -415,7 +460,7 @@ def _confirm_write(result) -> bool:
 def _log_summary(summary) -> None:
     LOGGER.info(
         "Scan complete total=%s completed=%s verified=%s ping_only=%s unreachable=%s excluded=%s "
-        "ptr_found=%s netbox_created=%s netbox_existing=%s netbox_drift=%s",
+        "ptr_found=%s netbox_created=%s netbox_updated=%s netbox_existing=%s netbox_drift=%s",
         summary.total_hosts,
         summary.hosts_completed,
         summary.verified,
@@ -424,6 +469,7 @@ def _log_summary(summary) -> None:
         summary.excluded,
         summary.ptr_found,
         summary.netbox_created,
+        summary.netbox_updated,
         summary.netbox_existing,
         summary.netbox_drift,
     )
@@ -614,8 +660,10 @@ def _run_scan_locked(
     except RuntimeError as exc:
         config_source = _config_source_label(config_path)
         raise click.ClickException(
-            f"{exc} Config source: {config_source}. "
-            f"Compare with: curl -H \"Authorization: {netbox_authorization_scheme(config.netbox.api_token)} <token-from-config>\" "
+            f"{exc}\n"
+            f"Config source: {config_source}.\n"
+            f"Compare with: curl -H \"Authorization: "
+            f"{netbox_authorization_scheme(config.netbox.api_token)} <token-from-config>\" "
             f"{config.netbox.base_url.rstrip('/')}/api/status/"
         ) from exc
 
@@ -703,19 +751,7 @@ def _run_scan_locked(
         run_kwargs["prefix_exclusion_ranges"] = resolved.exclusion_ranges
 
     if interactive:
-        with Progress(
-            TextColumn("{task.fields[current_ip]}", justify="left"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            TimeRemainingColumn(),
-            TextColumn(
-                "verified={task.fields[verified]} "
-                "phantom={task.fields[phantom]} "
-                "excluded={task.fields[excluded]} "
-                "drift={task.fields[drift]}"
-            ),
-            console=console,
-        ) as progress:
+        with _scan_progress(console) as progress:
             task_id = progress.add_task(
                 "scan",
                 total=1,
@@ -741,7 +777,7 @@ def _run_scan_locked(
 
             summary = scanner.run(
                 **run_kwargs,
-                approval_callback=_confirm_write if confirm and not auto_confirm else None,
+                approval_callback=_confirm_write if confirm else None,
                 progress_callback=progress_callback,
             )
     else:
@@ -784,7 +820,7 @@ def _run_scan_locked(
 @click.option("--exclude-file", type=click.Path(exists=True, dir_okay=False, path_type=str))
 @click.option("--output", type=click.Path(dir_okay=False, path_type=str))
 @click.option("--confirm/--no-confirm", default=False, help="Interactively confirm each NetBox write.")
-@click.option("--auto-confirm", is_flag=True, help="Approve all NetBox writes.")
+@click.option("--auto-confirm/--no-auto-confirm", default=True, help="Write verified hosts to NetBox without prompts.")
 @click.option("--max-hosts", type=int, default=None, help="Abort if deduplicated target count exceeds this limit.")
 @click.option("--schedule", type=str, help="Cron expression for scheduled runs.")
 def main(
@@ -803,16 +839,13 @@ def main(
     max_hosts: int | None,
     schedule: str | None,
 ) -> None:
-    if confirm and auto_confirm:
-        raise click.UsageError("Use either --confirm or --auto-confirm, not both.")
     if schedule and confirm:
         raise click.UsageError(
             "--confirm is not supported with --schedule. Use --auto-confirm for unattended NetBox writes."
         )
     if schedule and not dry_run and not auto_confirm:
         click.echo(
-            "Warning: scheduled runs without --auto-confirm will scan and report drift "
-            "but will not write to NetBox.",
+            "Warning: scheduled runs with --no-auto-confirm will scan but will not write to NetBox.",
             err=True,
         )
 

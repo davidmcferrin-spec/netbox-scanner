@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from .terminal import format_list_preview
+
 LOGGER = logging.getLogger(__name__)
 
 # NetBox 4.5+ v2 tokens: nbt_<id>.<secret> (Bearer). Legacy v1 tokens use Token scheme.
@@ -59,6 +61,9 @@ class IpAddressWriteResult:
     status: str
     payload: dict[str, str]
     netbox_dns_name: str | None = None
+    previous_dns_name: str | None = None
+    record_id: int | None = None
+    update_payload: dict[str, str] | None = None
 
 
 def _as_mapping(record: Any) -> dict[str, Any]:
@@ -381,7 +386,7 @@ def scan_preview_for_prefix(record: PrefixRecord, records: list[PrefixRecord]) -
     targets = scan_targets_for_prefix(record, records)
     if targets == [record.prefix]:
         return "(scans this prefix)"
-    return ", ".join(targets)
+    return format_list_preview(targets)
 
 
 def _record_by_cidr(records: list[PrefixRecord], cidr: str) -> PrefixRecord | None:
@@ -992,6 +997,44 @@ def build_ip_address_payload(ip: str, hostname: str | None = None) -> dict[str, 
     return payload
 
 
+def record_description(record: Any) -> str:
+    if isinstance(record, dict):
+        return str(record.get("description") or "")
+    return str(getattr(record, "description", "") or "")
+
+
+def record_id_value(record: Any) -> int:
+    if isinstance(record, dict):
+        return int(record.get("id") or 0)
+    return int(getattr(record, "id", 0) or 0)
+
+
+def format_previous_dns_name_note(previous_dns_name: str | None) -> str:
+    previous = previous_dns_name.strip() if previous_dns_name else "(none)"
+    return f"Previous dns_name: {previous} (netbox-scanner)"
+
+
+def append_previous_dns_name_note(description: str, previous_dns_name: str | None) -> str:
+    note = format_previous_dns_name_note(previous_dns_name)
+    if not description.strip():
+        return note
+    return f"{description.rstrip()}\n{note}"
+
+
+def build_ip_address_update(existing: Any, hostname: str | None) -> dict[str, str]:
+    address = existing.get("address") if isinstance(existing, dict) else getattr(existing, "address", "")
+    ip = str(address).split("/")[0]
+    payload = build_ip_address_payload(ip, hostname)
+    old_dns = record_dns_name(existing)
+    update: dict[str, str] = {
+        "id": str(record_id_value(existing)),
+        "description": append_previous_dns_name_note(record_description(existing), old_dns or None),
+    }
+    if "dns_name" in payload:
+        update["dns_name"] = payload["dns_name"]
+    return update
+
+
 def normalize_hostname(hostname: str | None) -> str:
     if not hostname:
         return ""
@@ -1168,31 +1211,72 @@ class NetBoxClient:
 
         netbox_dns = record_dns_name(existing)
         verified = normalize_hostname(hostname)
+        record_id = record_id_value(existing) or None
         if netbox_dns == verified:
             return IpAddressWriteResult(
                 status="already_exists",
                 payload=payload,
                 netbox_dns_name=netbox_dns or None,
+                previous_dns_name=netbox_dns or None,
+                record_id=record_id,
             )
 
         return IpAddressWriteResult(
             status="drift",
             payload=payload,
             netbox_dns_name=netbox_dns or None,
+            previous_dns_name=netbox_dns or None,
+            record_id=record_id,
+            update_payload=build_ip_address_update(existing, hostname),
         )
+
+    def upsert_ip_address(self, ip: str, hostname: str | None = None, *, dry_run: bool = False) -> IpAddressWriteResult:
+        evaluation = self.evaluate_ip_address(ip, hostname)
+        if evaluation.status == "already_exists":
+            return evaluation
+
+        if dry_run:
+            return evaluation
+
+        if evaluation.status == "not_found":
+            self._sleep()
+            try:
+                self.api.ipam.ip_addresses.create(evaluation.payload)
+            except Exception as exc:
+                self._handle_request_error(exc)
+            return IpAddressWriteResult(status="created", payload=evaluation.payload)
+
+        if evaluation.status == "drift":
+            update_payload = evaluation.update_payload or build_ip_address_update(
+                self.api.ipam.ip_addresses.get(address=evaluation.payload["address"]),
+                hostname,
+            )
+            self._sleep()
+            try:
+                self.api.ipam.ip_addresses.update([update_payload])
+            except Exception as exc:
+                self._handle_request_error(exc)
+            return IpAddressWriteResult(
+                status="updated",
+                payload=evaluation.payload,
+                update_payload=update_payload,
+                netbox_dns_name=evaluation.netbox_dns_name,
+                previous_dns_name=evaluation.previous_dns_name,
+                record_id=evaluation.record_id,
+            )
+
+        return evaluation
 
     def create_ip_address(self, ip: str, hostname: str | None = None, dry_run: bool = False):
         if dry_run:
+            evaluation = self.evaluate_ip_address(ip, hostname)
+            if evaluation.status == "drift":
+                return evaluation
+            if evaluation.status == "already_exists":
+                return evaluation
             return build_ip_address_payload(ip, hostname)
 
-        evaluation = self.evaluate_ip_address(ip, hostname)
-        if evaluation.status != "not_found":
+        evaluation = self.upsert_ip_address(ip, hostname, dry_run=False)
+        if evaluation.status == "already_exists":
             return evaluation
-
-        self._sleep()
-        try:
-            self.api.ipam.ip_addresses.create(evaluation.payload)
-        except Exception as exc:
-            self._handle_request_error(exc)
-
-        return IpAddressWriteResult(status="created", payload=evaluation.payload)
+        return evaluation

@@ -93,6 +93,7 @@ class ScanSummary:
     excluded: int = 0
     ptr_found: int = 0
     netbox_created: int = 0
+    netbox_updated: int = 0
     netbox_existing: int = 0
     netbox_drift: int = 0
     results: list[ScanResult] = field(default_factory=list)
@@ -241,7 +242,7 @@ class NetworkScanner:
         speed: str,
         exclude_file: str | None = None,
         dry_run: bool = False,
-        auto_confirm: bool = False,
+        auto_confirm: bool = True,
         max_hosts: int | None = None,
         approval_callback: Callable[[ScanResult], bool] | None = None,
         progress_callback: Callable[[ScanSummary, ScanResult], None] | None = None,
@@ -363,18 +364,6 @@ class NetworkScanner:
         result.netbox_dns_name = evaluation.netbox_dns_name
         result.netbox_status = evaluation.status
 
-        if evaluation.status == "drift":
-            summary.netbox_drift += 1
-            if not result.reason:
-                result.reason = "dns_drift"
-            self.logger.warning(
-                "DNS drift for %s: NetBox dns_name=%r PTR hostname=%r",
-                result.ip,
-                evaluation.netbox_dns_name,
-                hostname,
-            )
-            return
-
         if evaluation.status == "already_exists":
             summary.netbox_existing += 1
             if not result.reason:
@@ -382,18 +371,37 @@ class NetworkScanner:
             return
 
         if dry_run:
+            if evaluation.status == "drift":
+                summary.netbox_drift += 1
+                result.netbox_payload = evaluation.update_payload or evaluation.payload
+                if not result.reason:
+                    result.reason = "dry_run"
+                return
             result.netbox_status = "planned"
             result.reason = "dry_run"
             return
 
-        approved = auto_confirm or (approval_callback(result) if approval_callback else False)
+        if approval_callback:
+            approved = approval_callback(result)
+        else:
+            approved = auto_confirm
         if not approved:
             result.netbox_status = "planned"
             result.reason = "not_confirmed"
             return
 
-        write_result = self.netbox_client.create_ip_address(result.ip, hostname=hostname, dry_run=False)
-        result.netbox_written = True
+        write_result = self.netbox_client.upsert_ip_address(result.ip, hostname=hostname, dry_run=False)
+        if write_result.status in ("created", "updated"):
+            result.netbox_written = True
         result.netbox_status = write_result.status
         result.reason = write_result.status
-        summary.netbox_created += 1
+        if write_result.status == "created":
+            summary.netbox_created += 1
+        elif write_result.status == "updated":
+            summary.netbox_updated += 1
+            self.logger.info(
+                "Updated NetBox %s dns_name from %r to %r",
+                result.ip,
+                evaluation.netbox_dns_name,
+                hostname,
+            )

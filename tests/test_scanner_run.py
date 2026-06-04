@@ -149,7 +149,28 @@ class ScannerRunTests(unittest.TestCase):
         self.assertEqual(0, summary.verified)
         phantom = [result for result in summary.results if result.reason == "phantom_suspect"]
         self.assertEqual(1, len(phantom))
-        self.netbox_client.create_ip_address.assert_not_called()
+        self.netbox_client.upsert_ip_address.assert_not_called()
+
+    def test_run_creates_when_verified_by_default(self):
+        nmap_scanner = MagicMock()
+        nmap_scanner.scan.return_value = self._verified_nmap_response("10.0.0.1")
+        scanner = self._make_scanner(lambda ip: ip == "10.0.0.1", nmap_scanner)
+
+        dns_result = DNSLookupResult(ip="10.0.0.1", ptr_hostname="host.example.com", reason="lookup_ok")
+        self.netbox_client.evaluate_ip_address.return_value = IpAddressWriteResult(
+            status="not_found",
+            payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "host.example.com"},
+        )
+        self.netbox_client.upsert_ip_address.return_value = IpAddressWriteResult(
+            status="created",
+            payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "host.example.com"},
+        )
+
+        with patch("netbox_scanner.scanner.lookup_dns", return_value=dns_result):
+            summary = scanner.run(range_names=["lab"], profile="services", speed="polite")
+
+        self.assertEqual(1, summary.netbox_created)
+        self.netbox_client.upsert_ip_address.assert_called_once()
 
     def test_run_creates_when_verified_and_auto_confirm(self):
         nmap_scanner = MagicMock()
@@ -161,7 +182,7 @@ class ScannerRunTests(unittest.TestCase):
             status="not_found",
             payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "host.example.com"},
         )
-        self.netbox_client.create_ip_address.return_value = IpAddressWriteResult(
+        self.netbox_client.upsert_ip_address.return_value = IpAddressWriteResult(
             status="created",
             payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "host.example.com"},
         )
@@ -178,6 +199,53 @@ class ScannerRunTests(unittest.TestCase):
         created = [result for result in summary.results if result.netbox_written]
         self.assertEqual(1, len(created))
         self.assertEqual("created", created[0].reason)
+
+    def test_run_updates_when_verified_and_dns_drift(self):
+        nmap_scanner = MagicMock()
+        nmap_scanner.scan.return_value = self._verified_nmap_response("10.0.0.1")
+        scanner = self._make_scanner(lambda ip: ip == "10.0.0.1", nmap_scanner)
+
+        dns_result = DNSLookupResult(ip="10.0.0.1", ptr_hostname="new.example.com", reason="lookup_ok")
+        self.netbox_client.evaluate_ip_address.return_value = IpAddressWriteResult(
+            status="drift",
+            payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "new.example.com"},
+            netbox_dns_name="old.example.com",
+            update_payload={
+                "id": "1",
+                "dns_name": "new.example.com",
+                "description": "Previous dns_name: old.example.com (netbox-scanner)",
+            },
+        )
+        self.netbox_client.upsert_ip_address.return_value = IpAddressWriteResult(
+            status="updated",
+            payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "new.example.com"},
+            netbox_dns_name="old.example.com",
+        )
+
+        with patch("netbox_scanner.scanner.lookup_dns", return_value=dns_result):
+            summary = scanner.run(range_names=["lab"], profile="services", speed="polite")
+
+        self.assertEqual(1, summary.netbox_updated)
+        updated = [result for result in summary.results if result.netbox_written]
+        self.assertEqual(1, len(updated))
+        self.assertEqual("updated", updated[0].reason)
+        self.assertEqual("old.example.com", updated[0].netbox_dns_name)
+
+    def test_run_respects_no_auto_confirm(self):
+        nmap_scanner = MagicMock()
+        nmap_scanner.scan.return_value = self._verified_nmap_response("10.0.0.1")
+        scanner = self._make_scanner(lambda ip: ip == "10.0.0.1", nmap_scanner)
+
+        dns_result = DNSLookupResult(ip="10.0.0.1", ptr_hostname="host.example.com", reason="lookup_ok")
+        self.netbox_client.evaluate_ip_address.return_value = IpAddressWriteResult(
+            status="not_found",
+            payload={"address": "10.0.0.1/32", "status": "active", "dns_name": "host.example.com"},
+        )
+
+        with patch("netbox_scanner.scanner.lookup_dns", return_value=dns_result):
+            scanner.run(range_names=["lab"], profile="services", speed="polite", auto_confirm=False)
+
+        self.netbox_client.upsert_ip_address.assert_not_called()
 
     def test_services_profile_verified_with_open_port(self):
         nmap_scanner = MagicMock()

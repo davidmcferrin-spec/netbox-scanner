@@ -12,6 +12,12 @@ from .netbox import (
     range_matches_skip_role,
     scan_preview_for_prefix,
 )
+from .terminal import effective_width
+
+
+def _text_column_max(console: Console | None, default: int = 18) -> int:
+    width = effective_width(console)
+    return max(12, min(default, width // 5))
 
 
 def parse_prefix_selection(raw: str, total: int) -> list[int]:
@@ -44,8 +50,12 @@ def render_child_prefixes_table(
     all_records = all_prefixes or display_prefixes
     output = console or Console()
     table = Table(title="Child Prefixes To Scan")
-    table.add_column("Parent / standalone")
-    table.add_column("Child prefixes to scan")
+    table.add_column("Parent / standalone", no_wrap=True)
+    table.add_column(
+        "Child prefixes to scan",
+        overflow="fold",
+        max_width=max(30, effective_width(output) - 24),
+    )
     for prefix in display_prefixes:
         table.add_row(
             prefix.prefix,
@@ -66,12 +76,13 @@ def prompt_prefix_selection(
     all_records = all_prefixes or prefixes
     target_counts = build_scan_target_counts(prefixes, all_records)
     output = console or Console()
+    text_max = _text_column_max(output)
     table = Table(title="NetBox Prefixes")
-    table.add_column("#", justify="right")
-    table.add_column("Prefix")
-    table.add_column("Description")
-    table.add_column("Site")
-    table.add_column("Scan targets", justify="right")
+    table.add_column("#", justify="right", no_wrap=True)
+    table.add_column("Prefix", no_wrap=True)
+    table.add_column("Description", max_width=text_max, overflow="ellipsis")
+    table.add_column("Site", max_width=text_max, overflow="ellipsis")
+    table.add_column("Scan targets", justify="right", no_wrap=True)
     for index, prefix in enumerate(prefixes, start=1):
         target_label = format_scan_target_label(target_counts[prefix.id])
         table.add_row(
@@ -107,13 +118,14 @@ def render_range_plan(
     console: Console | None = None,
 ) -> None:
     output = console or Console()
+    text_max = _text_column_max(output)
     table = Table(title="Scan Plan (legacy IP ranges)")
-    table.add_column("Prefix")
-    table.add_column("Range name")
-    table.add_column("Role")
-    table.add_column("Start")
-    table.add_column("End")
-    table.add_column("Status")
+    table.add_column("Prefix", no_wrap=True)
+    table.add_column("Range name", max_width=text_max, overflow="ellipsis")
+    table.add_column("Role", max_width=text_max, overflow="ellipsis")
+    table.add_column("Start", no_wrap=True)
+    table.add_column("End", no_wrap=True)
+    table.add_column("Status", max_width=text_max, overflow="ellipsis")
     for record in ranges:
         if record.name in skipped_names:
             status = "skipped (name)"
@@ -141,20 +153,21 @@ def render_prefix_scan_plan(
     console: Console | None = None,
 ) -> None:
     output = console or Console()
+    text_max = _text_column_max(output)
 
     prefix_table = Table(title="Scan Prefixes")
-    prefix_table.add_column("Prefix")
+    prefix_table.add_column("Prefix", no_wrap=True)
     for cidr in scan_prefixes:
         prefix_table.add_row(cidr)
     output.print(prefix_table)
 
     exclusion_table = Table(title="IP Range Exclusions")
-    exclusion_table.add_column("Prefix")
-    exclusion_table.add_column("Range name")
-    exclusion_table.add_column("Role")
-    exclusion_table.add_column("Start")
-    exclusion_table.add_column("End")
-    exclusion_table.add_column("Reason")
+    exclusion_table.add_column("Prefix", no_wrap=True)
+    exclusion_table.add_column("Range name", max_width=text_max, overflow="ellipsis")
+    exclusion_table.add_column("Role", max_width=text_max, overflow="ellipsis")
+    exclusion_table.add_column("Start", no_wrap=True)
+    exclusion_table.add_column("End", no_wrap=True)
+    exclusion_table.add_column("Reason", max_width=text_max, overflow="ellipsis")
     for record in exclusion_ranges:
         reason = range_exclusion_reason(record, skip_names=skip_names, skip_roles=skip_roles)
         exclusion_table.add_row(
