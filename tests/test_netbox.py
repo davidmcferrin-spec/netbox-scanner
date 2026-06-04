@@ -37,9 +37,13 @@ from netbox_scanner.netbox import (
     PrefixRecord,
     sort_hosts_numeric,
     sort_prefix_cidrs_numeric,
+    NETBOX_DESCRIPTION_MAX_LEN,
     netbox_authorization_header,
     netbox_authorization_scheme,
     normalize_hostname,
+    sanitize_write_payload,
+    truncate_netbox_description,
+    upsert_scanner_description_line,
     parse_range_record,
     parse_role,
     range_contained_in_prefix,
@@ -66,6 +70,26 @@ def make_duplicate_ip_request_error(existing_address: str):
         status_code=400,
         reason="Bad Request",
         url="https://netbox.example.com/api/ipam/ip-addresses/",
+        request=SimpleNamespace(body=None),
+        json=lambda: body,
+        text=json.dumps(body),
+    )
+    return pynetbox.RequestError(req)
+
+
+def make_description_length_error():
+    try:
+        import json
+
+        import pynetbox
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("pynetbox is required for description length tests.") from exc
+
+    body = {"description": ["Ensure this field has no more than 200 characters."]}
+    req = SimpleNamespace(
+        status_code=400,
+        reason="Bad Request",
+        url="https://netbox.example.com/api/ipam/ip-addresses/7/",
         request=SimpleNamespace(body=None),
         json=lambda: body,
         text=json.dumps(body),
@@ -1176,3 +1200,52 @@ class NetBoxTests(unittest.TestCase):
                 self.req = req
 
         return RequestError(req)
+
+
+class DescriptionTruncateTests(unittest.TestCase):
+    def test_truncate_netbox_description_keeps_tail(self):
+        tail = "netbox-scanner: drift: PTR=host.example.com @ 2026-01-01"
+        long_text = ("manual " * 40) + tail
+        truncated = truncate_netbox_description(long_text, context="test")
+        self.assertLessEqual(len(truncated), NETBOX_DESCRIPTION_MAX_LEN)
+        self.assertTrue(truncated.endswith(tail[-20:]))
+
+    def test_upsert_scanner_description_line_respects_max_length(self):
+        base = "legacy note\n" + ("x" * 180)
+        with patch("netbox_scanner.netbox.scanner_note_timestamp", return_value="2026-06-03 12:00:00 UTC"):
+            merged = upsert_scanner_description_line(
+                base,
+                "netbox-scanner: drift:",
+                "PTR=host.example.com, NetBox-dns=old.example.com",
+            )
+        self.assertLessEqual(len(merged), NETBOX_DESCRIPTION_MAX_LEN)
+
+
+class NetBoxWriteResilienceTests(unittest.TestCase):
+    def test_apply_supplemental_returns_write_failed_without_raising(self):
+        ip_addresses = FakeIPAddresses(
+            {
+                "10.0.0.50/32": {
+                    "id": 50,
+                    "address": "10.0.0.50/32",
+                    "dns_name": "host.example.com",
+                    "description": "",
+                }
+            },
+            update_error=make_description_length_error(),
+        )
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.apply_supplemental(
+            ip_addresses.get(50),
+            custom_fields_patch={"scanner_miss_count": 1},
+            dry_run=False,
+        )
+
+        self.assertEqual("write_failed", result.status)
+        self.assertEqual([], ip_addresses.updated)
+
+    def test_sanitize_write_payload_truncates_description(self):
+        payload = {"description": "a" * 250, "dns_name": "host.example.com"}
+        sanitized = sanitize_write_payload(payload, context="test")
+        self.assertLessEqual(len(sanitized["description"]), NETBOX_DESCRIPTION_MAX_LEN)

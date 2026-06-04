@@ -246,6 +246,8 @@ Each type replaces any previous line with the same prefix:
 | `netbox-scanner: drift: …` | PTR / NetBox / CheckMK mismatch on fast path or re-verify |
 | `netbox-scanner: stale miss: …` | Miss counter progress toward stale threshold |
 
+Descriptions are truncated to **200 characters** (NetBox limit), keeping the **tail** (newest scanner lines). Failed writes return `write_failed`, are logged with IP/record/context, and the scan **continues**.
+
 ### Tags
 
 - **`netbox-scanner`** (`scanner.verified_tag_slug`): applied on verified writes and successful fast-path refresh.

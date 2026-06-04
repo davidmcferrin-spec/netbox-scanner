@@ -331,6 +331,25 @@ class NetworkScanner:
         result.checkmk_monitored = lookup.monitored
         result.checkmk_host_name = lookup.host_name
 
+    def _note_netbox_write_failure(
+        self,
+        result: ScanResult,
+        write_result: Any,
+        *,
+        context: str,
+    ) -> None:
+        if getattr(write_result, "status", None) != "write_failed":
+            return
+        result.netbox_status = "write_failed"
+        result.reason = "write_failed"
+        record_id = getattr(write_result, "record_id", None)
+        self.logger.warning(
+            "NetBox write failed for %s context=%s record_id=%s (scan continues)",
+            result.ip,
+            context,
+            record_id if record_id is not None else "-",
+        )
+
     def _finalize_result(
         self,
         summary: ScanSummary,
@@ -363,12 +382,13 @@ class NetworkScanner:
         result.reason = "fast_path_miss"
         if dry_run or not auto_confirm:
             return
-        self.netbox_client.apply_supplemental(
+        write_result = self.netbox_client.apply_supplemental(
             existing,
             custom_fields_patch=miss_fields,
             description=miss_note,
             dry_run=False,
         )
+        self._note_netbox_write_failure(result, write_result, context="fast_path_miss")
 
     def _handle_fast_path_verified(
         self,
@@ -421,13 +441,16 @@ class NetworkScanner:
                 approval_callback=None,
                 sync_checkmk_dns=False,
             )
-        self.netbox_client.apply_supplemental(
+        supplemental = self.netbox_client.apply_supplemental(
             existing,
             tag_slugs=tag_slugs,
             custom_fields_patch=fields,
             description=drift_desc,
             dry_run=False,
         )
+        self._note_netbox_write_failure(result, supplemental, context="fast_path_supplemental")
+        if result.reason == "write_failed":
+            return
         result.netbox_written = True
         result.reason = "fast_path_ok"
 
@@ -449,6 +472,7 @@ class NetworkScanner:
             tag_slugs=[phantom_slug],
             dry_run=False,
         )
+        self._note_netbox_write_failure(result, write, context="phantom_tag")
         if write.status in ("updated", "tag_update"):
             result.phantom_tag_applied = True
 
@@ -572,11 +596,12 @@ class NetworkScanner:
             open_ports=result.open_ports,
         )
         fields.update(build_miss_count_fields(slugs, 0))
-        self.netbox_client.apply_supplemental(
+        write_result = self.netbox_client.apply_supplemental(
             existing,
             custom_fields_patch=fields,
             dry_run=False,
         )
+        self._note_netbox_write_failure(result, write_result, context="post_write_metadata")
 
     def _scan_target_hosts(
         self,
@@ -660,7 +685,21 @@ class NetworkScanner:
         def work(ip: str) -> str:
             if host_started_callback:
                 host_started_callback(summary, ip)
-            result = self._process_ip(ip=ip, existing=ip_index.get(ip), **process_kwargs)
+            try:
+                result = self._process_ip(ip=ip, existing=ip_index.get(ip), **process_kwargs)
+            except Exception as exc:
+                self.logger.error(
+                    "Host scan failed ip=%s profile=%s error=%s (scan continues)",
+                    ip,
+                    profile,
+                    exc,
+                    exc_info=True,
+                )
+                result = ScanResult(
+                    ip=ip,
+                    liveness="unreachable",
+                    reason=f"scan_error:{type(exc).__name__}",
+                )
             self._finalize_result(summary, result, progress_callback)
             if prefix_state:
                 with self._summary_lock:
@@ -974,6 +1013,13 @@ class NetworkScanner:
             verified_tag_slug=verified_tag_slug,
             discovery=discovery,
         )
+        if write_result.status == "write_failed":
+            self._note_netbox_write_failure(
+                result,
+                write_result,
+                context=f"upsert profile={profile}",
+            )
+            return
         if write_result.status in ("created", "updated"):
             result.netbox_written = True
             if apply_checkmk_tag:

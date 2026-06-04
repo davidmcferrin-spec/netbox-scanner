@@ -510,6 +510,45 @@ class ScannerRunTests(unittest.TestCase):
             scanner.run(range_names=["lab"], profile="services", speed="polite", dry_run=True)
             batch.assert_called_once()
 
+    def test_run_continues_when_supplemental_write_fails(self):
+        self.config.scanner.behavior = ScannerBehaviorConfig(
+            fast_path_existing_netbox=True,
+            nmap_mode="sequential",
+            parallel_workers=1,
+        )
+        existing = {
+            "id": 9,
+            "address": "10.0.0.1/32",
+            "dns_name": "host.example.com",
+            "description": "",
+        }
+        self.netbox_client.fetch_ip_index_for_prefix.return_value = {
+            "10.0.0.1": existing,
+            "10.0.0.2": existing,
+        }
+        self.netbox_client.fetch_exclusion_ranges_for_prefixes.return_value = []
+        nmap_scanner = MagicMock()
+        scanner = self._make_scanner(lambda ip: True, nmap_scanner)
+        dns_result = DNSLookupResult(ip="10.0.0.1", ptr_hostname="host.example.com", reason="lookup_ok")
+        self.netbox_client.apply_supplemental.return_value = IpAddressWriteResult(
+            status="write_failed",
+            payload={"address": "10.0.0.1/32"},
+            record_id=9,
+        )
+
+        with patch("netbox_scanner.scanner.lookup_dns", return_value=dns_result):
+            summary = scanner.run(
+                scan_prefixes=["10.0.0.0/30"],
+                profile="services",
+                speed="polite",
+                dry_run=False,
+                auto_confirm=True,
+            )
+
+        self.assertEqual(2, summary.hosts_completed)
+        failed = [r for r in summary.results if r.reason == "write_failed"]
+        self.assertEqual(2, len(failed))
+
     def test_validate_scanner_behavior_rejects_unknown_nmap_mode(self):
         self.config.scanner.behavior = ScannerBehaviorConfig(nmap_mode="invalid")
         with self.assertRaisesRegex(ValueError, "nmap_mode"):

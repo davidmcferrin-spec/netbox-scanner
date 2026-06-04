@@ -71,6 +71,8 @@ class IpAddressWriteResult:
 NO_PTR_DISCOVERY_MARKER = "netbox-scanner: verified (no PTR)"
 PREVIOUS_DNS_NAME_PREFIX = "netbox-scanner: Previous dns_name:"
 DEFAULT_VERIFIED_TAG_SLUG = "netbox-scanner"
+NETBOX_DESCRIPTION_MAX_LEN = 200
+DESCRIPTION_TRUNCATE_SUFFIX = "…"
 
 
 @dataclass(slots=True)
@@ -1042,6 +1044,72 @@ def scanner_note_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def truncate_netbox_description(
+    description: str,
+    *,
+    max_len: int = NETBOX_DESCRIPTION_MAX_LEN,
+    context: str = "",
+) -> str:
+    """Fit NetBox IP address description (default max 200 chars); keep tail (newest lines)."""
+    if description is None:
+        return ""
+    text = str(description)
+    if len(text) <= max_len:
+        return text
+    keep = max_len - len(DESCRIPTION_TRUNCATE_SUFFIX)
+    if keep < 1:
+        return text[:max_len]
+    truncated = f"{DESCRIPTION_TRUNCATE_SUFFIX}{text[-keep:]}"
+    log_context = f" context={context}" if context else ""
+    LOGGER.warning(
+        "NetBox description truncated from %s to %s chars%s",
+        len(text),
+        len(truncated),
+        log_context,
+    )
+    return truncated
+
+
+def sanitize_write_payload(payload: dict[str, Any], *, context: str = "") -> dict[str, Any]:
+    """Return a copy with description truncated when present."""
+    if "description" not in payload:
+        return payload
+    sanitized = dict(payload)
+    sanitized["description"] = truncate_netbox_description(
+        str(sanitized.get("description") or ""),
+        context=context or "write_payload",
+    )
+    return sanitized
+
+
+def is_recoverable_write_error(exc: Exception) -> bool:
+    """Client-side NetBox write failures that should not abort the scan."""
+    try:
+        import pynetbox
+    except ImportError:  # pragma: no cover
+        return False
+    if not isinstance(exc, pynetbox.RequestError):
+        return False
+    if is_no_data_provided_error(exc):
+        return True
+    status_code = getattr(getattr(exc, "req", None), "status_code", None)
+    return status_code in (400, 404, 409, 422)
+
+
+def format_request_error_detail(exc: Exception) -> str:
+    try:
+        import pynetbox
+    except ImportError:  # pragma: no cover
+        return str(exc)
+    if isinstance(exc, pynetbox.RequestError):
+        status_code = getattr(getattr(exc, "req", None), "status_code", None)
+        error_body = getattr(exc, "error", None)
+        if error_body is not None:
+            return f"HTTP {status_code} {error_body!r}"
+        return f"HTTP {status_code} {exc}"
+    return str(exc)
+
+
 def upsert_scanner_description_line(description: str, line_prefix: str, body: str) -> str:
     """Replace any prior scanner line with the same prefix; append timestamp."""
     timestamp = scanner_note_timestamp()
@@ -1060,8 +1128,10 @@ def upsert_scanner_description_line(description: str, line_prefix: str, body: st
     ]
     base = "\n".join(lines).rstrip()
     if not base:
-        return new_line
-    return f"{base}\n{new_line}"
+        merged = new_line
+    else:
+        merged = f"{base}\n{new_line}"
+    return truncate_netbox_description(merged, context=f"scanner_line:{line_prefix}")
 
 
 def _is_scanner_description_line(line: str, line_prefix: str) -> bool:
@@ -1085,7 +1155,10 @@ def build_ip_address_payload(
     if hostname:
         payload["dns_name"] = hostname
     elif discovery is not None:
-        payload["description"] = build_no_ptr_discovery_note("", discovery)
+        payload["description"] = truncate_netbox_description(
+            build_no_ptr_discovery_note("", discovery),
+            context="build_ip_address_payload",
+        )
     if tag_slugs:
         payload["tags"] = netbox_tags_payload(tag_slugs)
     return payload
@@ -1382,10 +1455,16 @@ def build_supplemental_update(
     if not hostname and discovery is not None:
         merged = merge_no_ptr_discovery_note(record_description(existing), discovery)
         if merged != record_description(existing):
-            update["description"] = merged
+            update["description"] = truncate_netbox_description(
+                merged,
+                context="build_supplemental_update:discovery",
+            )
             has_changes = True
     if description is not None and description != record_description(existing):
-        update["description"] = description
+        update["description"] = truncate_netbox_description(
+            description,
+            context="build_supplemental_update",
+        )
         has_changes = True
     if custom_fields_patch:
         merged_fields = merge_custom_fields_patch(existing, custom_fields_patch)
@@ -1421,7 +1500,10 @@ def build_ip_address_update(
     old_dns = record_dns_name(existing)
     update: dict[str, Any] = {
         "id": record_id_value(existing),
-        "description": merge_previous_dns_name_note(record_description(existing), old_dns or None),
+        "description": truncate_netbox_description(
+            merge_previous_dns_name_note(record_description(existing), old_dns or None),
+            context="build_ip_address_update",
+        ),
     }
     if "dns_name" in payload:
         update["dns_name"] = payload["dns_name"]
@@ -1483,6 +1565,25 @@ class NetBoxClient:
     def _sleep(self) -> None:
         if self.rate_limit > 0:
             time.sleep(self.rate_limit)
+
+    def _log_write_failure(
+        self,
+        *,
+        operation: str,
+        exc: Exception,
+        ip: str | None = None,
+        record_id: int | None = None,
+        patch_fields: list[str] | None = None,
+    ) -> None:
+        LOGGER.error(
+            "NetBox %s failed ip=%s record_id=%s patch_fields=%s detail=%s",
+            operation,
+            ip or "-",
+            record_id if record_id is not None else "-",
+            ",".join(patch_fields) if patch_fields else "-",
+            format_request_error_detail(exc),
+            exc_info=exc,
+        )
 
     def _handle_request_error(self, exc: Exception) -> None:
         try:
@@ -1631,7 +1732,17 @@ class NetBoxClient:
         if update_payload is None:
             raise RuntimeError("Missing NetBox update payload.")
         record_id = evaluation.record_id or int(update_payload["id"])
-        patch_body = {key: value for key, value in update_payload.items() if key != "id"}
+        patch_body = sanitize_write_payload(
+            {key: value for key, value in update_payload.items() if key != "id"},
+            context=f"patch record_id={record_id}",
+        )
+        address = str(evaluation.payload.get("address") or "")
+        ip_hint = ""
+        if address:
+            try:
+                ip_hint = str(ipaddress.ip_interface(address).ip)
+            except ValueError:
+                ip_hint = address
         if not patch_body:
             LOGGER.warning("Skipping NetBox update for record %s: no writable fields.", record_id)
             return IpAddressWriteResult(
@@ -1658,6 +1769,22 @@ class NetBoxClient:
                 )
                 return IpAddressWriteResult(
                     status="drift",
+                    payload=evaluation.payload,
+                    update_payload=update_payload,
+                    netbox_dns_name=evaluation.netbox_dns_name,
+                    previous_dns_name=evaluation.previous_dns_name,
+                    record_id=record_id,
+                )
+            if is_recoverable_write_error(exc):
+                self._log_write_failure(
+                    operation="update",
+                    exc=exc,
+                    ip=ip_hint or None,
+                    record_id=record_id,
+                    patch_fields=sorted(patch_body.keys()),
+                )
+                return IpAddressWriteResult(
+                    status="write_failed",
                     payload=evaluation.payload,
                     update_payload=update_payload,
                     netbox_dns_name=evaluation.netbox_dns_name,
@@ -1791,9 +1918,13 @@ class NetBoxClient:
             return evaluation
 
         if evaluation.status == "not_found":
+            create_payload = sanitize_write_payload(
+                evaluation.payload,
+                context=f"create ip={ip}",
+            )
             self._sleep()
             try:
-                self.api.ipam.ip_addresses.create(evaluation.payload)
+                self.api.ipam.ip_addresses.create(create_payload)
             except Exception as exc:
                 if is_duplicate_ip_address_error(exc):
                     return self._upsert_after_duplicate_create(
@@ -1806,8 +1937,19 @@ class NetBoxClient:
                         verified_tag_slug=verified_tag_slug,
                         discovery=discovery,
                     )
+                if is_recoverable_write_error(exc):
+                    self._log_write_failure(
+                        operation="create",
+                        exc=exc,
+                        ip=ip,
+                        patch_fields=sorted(create_payload.keys()),
+                    )
+                    return IpAddressWriteResult(
+                        status="write_failed",
+                        payload=create_payload,
+                    )
                 self._handle_request_error(exc)
-            return IpAddressWriteResult(status="created", payload=evaluation.payload)
+            return IpAddressWriteResult(status="created", payload=create_payload)
 
         if evaluation.status in ("drift", "tag_update"):
             if evaluation.update_payload is None and evaluation.status == "drift":
