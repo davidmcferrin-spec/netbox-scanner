@@ -64,7 +64,7 @@ class IpAddressWriteResult:
     netbox_dns_name: str | None = None
     previous_dns_name: str | None = None
     record_id: int | None = None
-    update_payload: dict[str, str] | None = None
+    update_payload: dict[str, Any] | None = None
 
 
 def _as_mapping(record: Any) -> dict[str, Any]:
@@ -1019,6 +1019,23 @@ def host_matches_address(ip: str, address_value: str) -> bool:
         return False
 
 
+def is_no_data_provided_error(exc: Exception) -> bool:
+    try:
+        import pynetbox
+    except ImportError:  # pragma: no cover - optional at test time
+        return False
+    if not isinstance(exc, pynetbox.RequestError):
+        return False
+    status_code = getattr(getattr(exc, "req", None), "status_code", None)
+    if status_code != 400:
+        return False
+    blob = str(exc)
+    error = getattr(exc, "error", None)
+    if error is not None:
+        blob = f"{blob} {error!r}"
+    return "No data provided" in blob
+
+
 def is_duplicate_ip_address_error(exc: Exception) -> bool:
     try:
         import pynetbox
@@ -1106,17 +1123,18 @@ def append_previous_dns_name_note(description: str, previous_dns_name: str | Non
     return f"{description.rstrip()}\n{note}"
 
 
-def build_ip_address_update(existing: Any, hostname: str | None) -> dict[str, str]:
-    address = existing.get("address") if isinstance(existing, dict) else getattr(existing, "address", "")
-    ip = str(address).split("/")[0]
+def build_ip_address_update(existing: Any, hostname: str | None) -> dict[str, Any]:
+    ip = str(record_address(existing)).split("/")[0]
     payload = build_ip_address_payload(ip, hostname)
     old_dns = record_dns_name(existing)
-    update: dict[str, str] = {
-        "id": str(record_id_value(existing)),
+    update: dict[str, Any] = {
+        "id": record_id_value(existing),
         "description": append_previous_dns_name_note(record_description(existing), old_dns or None),
     }
     if "dns_name" in payload:
         update["dns_name"] = payload["dns_name"]
+    elif old_dns:
+        update["dns_name"] = ""
     return update
 
 
@@ -1320,10 +1338,40 @@ class NetBoxClient:
         update_payload = evaluation.update_payload
         if update_payload is None:
             raise RuntimeError("Missing NetBox update payload.")
+        record_id = evaluation.record_id or int(update_payload["id"])
+        patch_body = {key: value for key, value in update_payload.items() if key != "id"}
+        if not patch_body:
+            LOGGER.warning("Skipping NetBox update for record %s: no writable fields.", record_id)
+            return IpAddressWriteResult(
+                status="drift",
+                payload=evaluation.payload,
+                update_payload=update_payload,
+                netbox_dns_name=evaluation.netbox_dns_name,
+                previous_dns_name=evaluation.previous_dns_name,
+                record_id=record_id,
+            )
         self._sleep()
         try:
-            self.api.ipam.ip_addresses.update([update_payload])
+            record = self.api.ipam.ip_addresses.get(record_id)
+            if record is None:
+                raise RuntimeError(f"NetBox IP address record {record_id} not found.")
+            record.update(patch_body)
         except Exception as exc:
+            if is_no_data_provided_error(exc):
+                LOGGER.warning(
+                    "NetBox rejected update for record %s (%s): %s",
+                    record_id,
+                    evaluation.payload.get("address", ""),
+                    exc,
+                )
+                return IpAddressWriteResult(
+                    status="drift",
+                    payload=evaluation.payload,
+                    update_payload=update_payload,
+                    netbox_dns_name=evaluation.netbox_dns_name,
+                    previous_dns_name=evaluation.previous_dns_name,
+                    record_id=record_id,
+                )
             self._handle_request_error(exc)
         return IpAddressWriteResult(
             status="updated",
@@ -1331,7 +1379,7 @@ class NetBoxClient:
             update_payload=update_payload,
             netbox_dns_name=evaluation.netbox_dns_name,
             previous_dns_name=evaluation.previous_dns_name,
-            record_id=evaluation.record_id,
+            record_id=record_id,
         )
 
     def _upsert_after_duplicate_create(

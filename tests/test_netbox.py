@@ -8,9 +8,11 @@ from netbox_scanner.netbox import (
     NetBoxClient,
     append_previous_dns_name_note,
     apply_skip_ranges,
+    build_ip_address_update,
     duplicate_address_from_error,
     host_matches_address,
     is_duplicate_ip_address_error,
+    is_no_data_provided_error,
     apply_skip_roles,
     build_skip_role_match_keys,
     collect_exclusion_ranges_for_prefixes,
@@ -48,6 +50,26 @@ def make_duplicate_ip_request_error(existing_address: str):
         status_code=400,
         reason="Bad Request",
         url="https://netbox.example.com/api/ipam/ip-addresses/",
+        request=SimpleNamespace(body=None),
+        json=lambda: body,
+        text=json.dumps(body),
+    )
+    return pynetbox.RequestError(req)
+
+
+def make_no_data_provided_error():
+    try:
+        import json
+
+        import pynetbox
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("pynetbox is required for no-data update tests.") from exc
+
+    body = {"non_field_errors": ["No data provided"]}
+    req = SimpleNamespace(
+        status_code=400,
+        reason="Bad Request",
+        url="https://netbox.example.com/api/ipam/ip-addresses/7/",
         request=SimpleNamespace(body=None),
         json=lambda: body,
         text=json.dumps(body),
@@ -106,14 +128,54 @@ class FakePrefixes:
         return self.prefixes
 
 
+class FakeIPAddressRecord:
+    def __init__(self, parent, record):
+        self._parent = parent
+        self._record = record
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name in self._record:
+            return self._record[name]
+        if name in ("description", "dns_name"):
+            return ""
+        raise AttributeError(name)
+
+    def update(self, data):
+        if self._parent.update_error is not None:
+            raise self._parent.update_error
+        if "dns_name" in data:
+            self._record["dns_name"] = data["dns_name"]
+        if "description" in data:
+            self._record["description"] = data["description"]
+        self._parent.updated.append({"id": self._record["id"], **data})
+        return self._record
+
+
 class FakeIPAddresses:
-    def __init__(self, records=None):
+    def __init__(self, records=None, *, update_error=None):
         self.records = records or {}
         self.created = []
         self.updated = []
+        self.update_error = update_error
 
-    def get(self, address):
-        return self.records.get(address)
+    def _wrap(self, record):
+        if record is None:
+            return None
+        if isinstance(record, FakeIPAddressRecord):
+            return record
+        return FakeIPAddressRecord(self, record)
+
+    def get(self, record_id=None, *, address=None):
+        if address is not None:
+            return self._wrap(self.records.get(address))
+        if record_id is not None:
+            for record in self.records.values():
+                if record.get("id") == record_id or str(record.get("id")) == str(record_id):
+                    return self._wrap(record)
+            return None
+        return None
 
     def filter(self, **kwargs):
         if "host" in kwargs:
@@ -644,6 +706,36 @@ class NetBoxTests(unittest.TestCase):
         self.assertIn("Previous dns_name: old.example.com (netbox-scanner)", result.update_payload["description"])
         self.assertIn("manual note", result.update_payload["description"])
         self.assertEqual("new.example.com", result.update_payload["dns_name"])
+        self.assertIsInstance(result.update_payload["id"], int)
+
+    def test_build_ip_address_update_clears_dns_name_without_ptr(self):
+        existing = {
+            "id": 3,
+            "address": "10.0.0.9/32",
+            "dns_name": "stale.example.com",
+            "description": "manual",
+        }
+        update = build_ip_address_update(existing, None)
+        self.assertEqual(3, update["id"])
+        self.assertEqual("", update["dns_name"])
+        self.assertIn("Previous dns_name: stale.example.com (netbox-scanner)", update["description"])
+
+    def test_is_no_data_provided_error_detects_netbox_message(self):
+        exc = make_no_data_provided_error()
+        self.assertTrue(is_no_data_provided_error(exc))
+        self.assertFalse(is_duplicate_ip_address_error(exc))
+
+    def test_upsert_ip_address_continues_when_netbox_rejects_empty_patch(self):
+        ip_addresses = FakeIPAddresses(
+            {"10.0.0.9/32": {"id": 7, "address": "10.0.0.9/32", "dns_name": "old.example.com"}},
+            update_error=make_no_data_provided_error(),
+        )
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.upsert_ip_address("10.0.0.9", hostname="new.example.com", dry_run=False)
+
+        self.assertEqual("drift", result.status)
+        self.assertEqual([], ip_addresses.updated)
 
     def test_append_previous_dns_name_note_uses_none_placeholder(self):
         self.assertEqual(

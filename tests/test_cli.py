@@ -116,7 +116,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("forward=", fields)
         self.assertEqual("already in NetBox", netbox_outcome_label(result))
 
-    def test_report_verified_find_uses_progress_log_during_live_scan(self):
+    def test_report_verified_find_uses_progress_console_print_during_live_scan(self):
         result = ScanResult(
             ip="10.0.0.1",
             liveness="verified",
@@ -126,14 +126,17 @@ class CliTests(unittest.TestCase):
             netbox_dns_name="host.example.com",
         )
         progress = MagicMock()
-        progress.console = Console(file=StringIO(), width=80, force_terminal=False)
+        mock_console = MagicMock()
+        mock_console.width = 80
+        progress.console = mock_console
 
         with patch("netbox_scanner.cli.console.print") as console_print:
             report_verified_find(result, logger=None, progress=progress)
 
-        progress.log.assert_called_once()
+        mock_console.print.assert_called_once()
         console_print.assert_not_called()
-        self.assertIn("[bold green]FIND[/bold green]", progress.log.call_args.args[0])
+        self.assertIn("[bold green]FIND[/bold green]", mock_console.print.call_args.args[0])
+        self.assertTrue(mock_console.print.call_args.kwargs.get("markup"))
 
     def test_netbox_outcome_label_for_dry_run(self):
         result = ScanResult(

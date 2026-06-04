@@ -382,7 +382,7 @@ def report_verified_find(
     )
     markup = _find_line_markup(display_line)
     if progress is not None:
-        progress.log(markup)
+        progress.console.print(markup, markup=True)
         return
     _print_find_line(display_line, output_console=output_console)
 
