@@ -67,6 +67,16 @@ class IpAddressWriteResult:
     update_payload: dict[str, Any] | None = None
 
 
+NO_PTR_DISCOVERY_MARKER = "netbox-scanner: verified (no PTR)"
+
+
+@dataclass(slots=True)
+class NoPtrDiscovery:
+    open_ports: list[int]
+    profile: str
+    nmap_up: bool = False
+
+
 def _as_mapping(record: Any) -> dict[str, Any]:
     if isinstance(record, dict):
         return record
@@ -994,12 +1004,15 @@ def build_ip_address_payload(
     hostname: str | None = None,
     *,
     tag_slug: str | None = None,
+    discovery: NoPtrDiscovery | None = None,
 ) -> dict[str, Any]:
     address = ipaddress.ip_address(ip)
     cidr = 32 if address.version == 4 else 128
     payload: dict[str, Any] = {"address": f"{address}/{cidr}", "status": "active"}
     if hostname:
         payload["dns_name"] = hostname
+    elif discovery is not None:
+        payload["description"] = build_no_ptr_discovery_note(discovery)
     if tag_slug:
         payload["tags"] = [{"slug": tag_slug}]
     return payload
@@ -1086,21 +1099,44 @@ def evaluate_existing_ip_address(
     payload: dict[str, Any],
     apply_checkmk_tag: bool = False,
     checkmk_tag_slug: str = "checkmk",
+    discovery: NoPtrDiscovery | None = None,
 ) -> IpAddressWriteResult:
     netbox_dns = record_dns_name(existing)
     verified = normalize_hostname(hostname)
     record_id = record_id_value(existing) or None
     tag_slug = checkmk_tag_slug if apply_checkmk_tag else None
-    needs_tag = bool(tag_slug and tag_slug.lower() not in record_tag_slugs(existing))
+    supplemental = build_supplemental_update(
+        existing,
+        tag_slug=tag_slug,
+        discovery=discovery,
+        hostname=hostname,
+    )
     if netbox_dns == verified:
-        if needs_tag:
+        if supplemental is not None:
             return IpAddressWriteResult(
                 status="tag_update",
                 payload=payload,
                 netbox_dns_name=netbox_dns or None,
                 previous_dns_name=netbox_dns or None,
                 record_id=record_id,
-                update_payload=build_tag_only_update(existing, tag_slug),
+                update_payload=supplemental,
+            )
+        return IpAddressWriteResult(
+            status="already_exists",
+            payload=payload,
+            netbox_dns_name=netbox_dns or None,
+            previous_dns_name=netbox_dns or None,
+            record_id=record_id,
+        )
+    if not hostname:
+        if supplemental is not None:
+            return IpAddressWriteResult(
+                status="tag_update",
+                payload=payload,
+                netbox_dns_name=netbox_dns or None,
+                previous_dns_name=netbox_dns or None,
+                record_id=record_id,
+                update_payload=supplemental,
             )
         return IpAddressWriteResult(
             status="already_exists",
@@ -1168,10 +1204,58 @@ def merge_checkmk_tag(existing: Any, tag_slug: str) -> list[dict[str, str]]:
 
 
 def build_tag_only_update(existing: Any, tag_slug: str) -> dict[str, Any]:
-    return {
+    return build_supplemental_update(existing, tag_slug=tag_slug) or {
         "id": record_id_value(existing),
         "tags": merge_checkmk_tag(existing, tag_slug),
     }
+
+
+def build_no_ptr_discovery_note(discovery: NoPtrDiscovery) -> str:
+    ports = ",".join(str(port) for port in discovery.open_ports) or "none"
+    reasons = ["ICMP OK"]
+    if discovery.open_ports:
+        reasons.append(f"open ports: {ports}")
+    elif discovery.nmap_up:
+        reasons.append("nmap host up")
+    else:
+        reasons.append("verified by scan profile")
+    reasons.append(f"profile={discovery.profile}")
+    return f"{NO_PTR_DISCOVERY_MARKER}; {'; '.join(reasons)}"
+
+
+def merge_no_ptr_discovery_note(description: str, note: str) -> str:
+    lines = [
+        line
+        for line in description.splitlines()
+        if not line.strip().startswith(NO_PTR_DISCOVERY_MARKER)
+    ]
+    base = "\n".join(lines).rstrip()
+    if not base:
+        return note
+    return f"{base}\n{note}"
+
+
+def build_supplemental_update(
+    existing: Any,
+    *,
+    tag_slug: str | None = None,
+    discovery: NoPtrDiscovery | None = None,
+    hostname: str | None = None,
+) -> dict[str, Any] | None:
+    update: dict[str, Any] = {"id": record_id_value(existing)}
+    has_changes = False
+    if tag_slug and tag_slug.lower() not in record_tag_slugs(existing):
+        update["tags"] = merge_checkmk_tag(existing, tag_slug)
+        has_changes = True
+    if not hostname and discovery is not None:
+        note = build_no_ptr_discovery_note(discovery)
+        merged = merge_no_ptr_discovery_note(record_description(existing), note)
+        if merged != record_description(existing):
+            update["description"] = merged
+            has_changes = True
+    if not has_changes:
+        return None
+    return update
 
 
 def format_previous_dns_name_note(previous_dns_name: str | None) -> str:
@@ -1201,8 +1285,6 @@ def build_ip_address_update(
     }
     if "dns_name" in payload:
         update["dns_name"] = payload["dns_name"]
-    elif old_dns:
-        update["dns_name"] = ""
     if tag_slug and tag_slug.lower() not in record_tag_slugs(existing):
         update["tags"] = merge_checkmk_tag(existing, tag_slug)
     return update
@@ -1460,6 +1542,7 @@ class NetBoxClient:
         exc: Exception,
         apply_checkmk_tag: bool = False,
         checkmk_tag_slug: str = "checkmk",
+        discovery: NoPtrDiscovery | None = None,
     ) -> IpAddressWriteResult:
         existing = self._lookup_ip_address(ip)
         if existing is None:
@@ -1477,6 +1560,7 @@ class NetBoxClient:
             ip,
             hostname,
             tag_slug=checkmk_tag_slug if apply_checkmk_tag else None,
+            discovery=discovery if not hostname else None,
         )
         evaluation = evaluate_existing_ip_address(
             existing,
@@ -1485,6 +1569,7 @@ class NetBoxClient:
             payload=payload,
             apply_checkmk_tag=apply_checkmk_tag,
             checkmk_tag_slug=checkmk_tag_slug,
+            discovery=discovery,
         )
         if evaluation.status == "already_exists":
             return evaluation
@@ -1497,11 +1582,13 @@ class NetBoxClient:
         *,
         apply_checkmk_tag: bool = False,
         checkmk_tag_slug: str = "checkmk",
+        discovery: NoPtrDiscovery | None = None,
     ) -> IpAddressWriteResult:
         payload = build_ip_address_payload(
             ip,
             hostname,
             tag_slug=checkmk_tag_slug if apply_checkmk_tag else None,
+            discovery=discovery if not hostname else None,
         )
         existing = self._lookup_ip_address(ip)
         if existing is None:
@@ -1513,6 +1600,7 @@ class NetBoxClient:
             payload=payload,
             apply_checkmk_tag=apply_checkmk_tag,
             checkmk_tag_slug=checkmk_tag_slug,
+            discovery=discovery,
         )
 
     def upsert_ip_address(
@@ -1523,12 +1611,14 @@ class NetBoxClient:
         dry_run: bool = False,
         apply_checkmk_tag: bool = False,
         checkmk_tag_slug: str = "checkmk",
+        discovery: NoPtrDiscovery | None = None,
     ) -> IpAddressWriteResult:
         evaluation = self.evaluate_ip_address(
             ip,
             hostname,
             apply_checkmk_tag=apply_checkmk_tag,
             checkmk_tag_slug=checkmk_tag_slug,
+            discovery=discovery,
         )
         if evaluation.status == "already_exists":
             return evaluation
@@ -1548,6 +1638,7 @@ class NetBoxClient:
                         exc=exc,
                         apply_checkmk_tag=apply_checkmk_tag,
                         checkmk_tag_slug=checkmk_tag_slug,
+                        discovery=discovery,
                     )
                 self._handle_request_error(exc)
             return IpAddressWriteResult(status="created", payload=evaluation.payload)
@@ -1563,6 +1654,7 @@ class NetBoxClient:
                         payload=evaluation.payload,
                         apply_checkmk_tag=apply_checkmk_tag,
                         checkmk_tag_slug=checkmk_tag_slug,
+                        discovery=discovery,
                     )
             return self._apply_ip_address_update(evaluation, hostname=hostname)
 

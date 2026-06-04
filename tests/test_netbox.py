@@ -8,10 +8,15 @@ from netbox_scanner.netbox import (
     NetBoxClient,
     append_previous_dns_name_note,
     apply_skip_ranges,
+    build_ip_address_payload,
     build_ip_address_update,
+    build_no_ptr_discovery_note,
+    build_supplemental_update,
     duplicate_address_from_error,
     evaluate_existing_ip_address,
     merge_checkmk_tag,
+    merge_no_ptr_discovery_note,
+    NoPtrDiscovery,
     host_matches_address,
     is_duplicate_ip_address_error,
     is_no_data_provided_error,
@@ -716,7 +721,7 @@ class NetBoxTests(unittest.TestCase):
         self.assertEqual("new.example.com", result.update_payload["dns_name"])
         self.assertIsInstance(result.update_payload["id"], int)
 
-    def test_build_ip_address_update_clears_dns_name_without_ptr(self):
+    def test_build_ip_address_update_preserves_dns_name_without_ptr(self):
         existing = {
             "id": 3,
             "address": "10.0.0.9/32",
@@ -724,9 +729,71 @@ class NetBoxTests(unittest.TestCase):
             "description": "manual",
         }
         update = build_ip_address_update(existing, None)
-        self.assertEqual(3, update["id"])
-        self.assertEqual("", update["dns_name"])
-        self.assertIn("Previous dns_name: stale.example.com (netbox-scanner)", update["description"])
+        self.assertNotIn("dns_name", update)
+
+        discovery = NoPtrDiscovery(open_ports=[22, 443], profile="services")
+        supplemental = build_supplemental_update(existing, discovery=discovery, hostname=None)
+        self.assertIsNotNone(supplemental)
+        self.assertIn("open ports: 22,443", supplemental["description"])
+        self.assertIn("manual", supplemental["description"])
+
+    def test_build_no_ptr_discovery_note_lists_ports_and_profile(self):
+        note = build_no_ptr_discovery_note(
+            NoPtrDiscovery(open_ports=[22, 80], profile="services", nmap_up=True)
+        )
+        self.assertIn("ICMP OK", note)
+        self.assertIn("open ports: 22,80", note)
+        self.assertIn("profile=services", note)
+
+    def test_merge_no_ptr_discovery_note_replaces_previous_scanner_line(self):
+        old = "manual note\nnetbox-scanner: verified (no PTR); ICMP OK; open ports: 22"
+        new = build_no_ptr_discovery_note(NoPtrDiscovery(open_ports=[443], profile="services"))
+        merged = merge_no_ptr_discovery_note(old, new)
+        self.assertIn("manual note", merged)
+        self.assertIn("open ports: 443", merged)
+        self.assertNotIn("open ports: 22", merged)
+
+    def test_build_ip_address_payload_sets_description_without_ptr(self):
+        discovery = NoPtrDiscovery(open_ports=[161], profile="services")
+        payload = build_ip_address_payload("10.0.0.8", None, discovery=discovery)
+        self.assertNotIn("dns_name", payload)
+        self.assertIn("open ports: 161", payload["description"])
+
+    def test_evaluate_ip_address_requests_discovery_update_when_no_ptr(self):
+        existing = {
+            "id": 5,
+            "address": "10.0.0.5/32",
+            "dns_name": "",
+            "description": "",
+        }
+        discovery = NoPtrDiscovery(open_ports=[22], profile="services")
+        evaluation = evaluate_existing_ip_address(
+            existing,
+            ip="10.0.0.5",
+            hostname=None,
+            payload=build_ip_address_payload("10.0.0.5", None, discovery=discovery),
+            discovery=discovery,
+        )
+        self.assertEqual("tag_update", evaluation.status)
+        self.assertIn("open ports: 22", evaluation.update_payload["description"])
+
+    def test_upsert_ip_address_creates_with_discovery_note_when_no_ptr(self):
+        ip_addresses = FakeIPAddresses()
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+        discovery = NoPtrDiscovery(open_ports=[22, 443], profile="services")
+
+        result = client.upsert_ip_address("10.0.0.7", hostname=None, dry_run=False, discovery=discovery)
+
+        self.assertEqual("created", result.status)
+        record = ip_addresses.records["10.0.0.7/32"]
+        self.assertNotIn("dns_name", record)
+        self.assertIn("open ports: 22,443", record["description"])
+
+    def test_append_previous_dns_name_note_uses_none_placeholder(self):
+        self.assertEqual(
+            "Previous dns_name: (none) (netbox-scanner)",
+            append_previous_dns_name_note("", None),
+        )
 
     def test_is_no_data_provided_error_detects_netbox_message(self):
         exc = make_no_data_provided_error()
@@ -744,12 +811,6 @@ class NetBoxTests(unittest.TestCase):
 
         self.assertEqual("drift", result.status)
         self.assertEqual([], ip_addresses.updated)
-
-    def test_append_previous_dns_name_note_uses_none_placeholder(self):
-        self.assertEqual(
-            "Previous dns_name: (none) (netbox-scanner)",
-            append_previous_dns_name_note("", None),
-        )
 
     def test_upsert_ip_address_updates_drift_and_appends_description(self):
         ip_addresses = FakeIPAddresses(

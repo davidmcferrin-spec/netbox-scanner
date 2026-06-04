@@ -98,7 +98,7 @@ During a run, prefixes and IP ranges are fetched once and cached on the client s
 
 Only one scan may run at a time: the default lock file is `~/.netbox-scanner.lock` (override with `scanner.lock_file`). It is created when a run starts and removed on normal exit, errors, or Ctrl+C; stale locks from crashed processes are replaced automatically.
 
-DNS (PTR, A, CNAME) is collected for reporting and as the `dns_name` written to NetBox. DNS never gates liveness or blocks writes. When an existing NetBox `dns_name` differs from PTR, the scanner updates it and appends `Previous dns_name: … (netbox-scanner)` to the IP address `description`.
+DNS (PTR, A, CNAME) is collected for reporting and as the `dns_name` written to NetBox when PTR exists. DNS never gates liveness or blocks writes. When PTR is missing, the scanner writes a **description** note with open ports and why the host was verified (ICMP + profile ports), instead of setting `dns_name`. When an existing NetBox `dns_name` differs from PTR, the scanner updates it and appends `Previous dns_name: … (netbox-scanner)` to the IP address `description`.
 
 ### CheckMK tagging (optional)
 

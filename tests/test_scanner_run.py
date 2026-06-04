@@ -245,6 +245,7 @@ class ScannerRunTests(unittest.TestCase):
             hostname="host.example.com",
             apply_checkmk_tag=True,
             checkmk_tag_slug="checkmk",
+            discovery=None,
         )
 
     def test_run_updates_when_verified_and_dns_drift(self):
