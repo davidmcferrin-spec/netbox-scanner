@@ -15,6 +15,7 @@
 - Phantom suspect detection for ping-only replies (e.g. switch/router proxy responses)
 - Informational DNS lookup (PTR, A, CNAME) for hostname hints — never blocks writes
 - DNS drift correction when NetBox `dns_name` differs from PTR (previous name appended to `description`)
+- Optional CheckMK 2.4+ REST lookup per verified host; assign a NetBox tag when the host exists in CheckMK
 - Verified hosts are written to NetBox by default; use `--no-auto-confirm`, `--confirm`, or `--dry-run` to change behavior
 - Configurable named scan profiles and `--speed` to nmap timing template mapping
 - `--max-hosts` guardrail for large ranges
@@ -99,6 +100,12 @@ Only one scan may run at a time: the default lock file is `~/.netbox-scanner.loc
 
 DNS (PTR, A, CNAME) is collected for reporting and as the `dns_name` written to NetBox. DNS never gates liveness or blocks writes. When an existing NetBox `dns_name` differs from PTR, the scanner updates it and appends `Previous dns_name: … (netbox-scanner)` to the IP address `description`.
 
+### CheckMK tagging (optional)
+
+Set `checkmk.enabled: true` in your config to query CheckMK 2.4+ (Community Edition) for each **verified** host using the REST API (`host_config/collections/all` filtered by `attributes.ipaddress`). Create the NetBox tag first (Extras → Tags), then set `checkmk.tag_slug` (default `checkmk`). The tag is applied only when CheckMK returns a host for that IP; absence of the tag implies the host was not found in CheckMK (or has not been scanned as verified yet).
+
+Authentication uses `Authorization: Bearer <automation_user> <automation_secret>`. Each lookup is a separate API call (`checkmk.rate_limit` adds delay between calls). FIND lines include `CheckMK=yes`, `CheckMK=no`, or the CheckMK host name when enabled.
+
 ## Scan profiles
 
 | Profile | Ports | Notes |
@@ -117,6 +124,7 @@ The API token needs:
 - `ipam > prefixes`: read
 - `ipam > ip-ranges`: read
 - `ipam > ip-addresses`: read + write
+- `extras > tags`: read (tag must exist before assignment)
 
 ## Choosing what to scan
 

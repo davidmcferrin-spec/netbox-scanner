@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from .terminal import format_list_preview
 
@@ -60,7 +60,7 @@ class RangeRecord:
 @dataclass(slots=True)
 class IpAddressWriteResult:
     status: str
-    payload: dict[str, str]
+    payload: dict[str, Any]
     netbox_dns_name: str | None = None
     previous_dns_name: str | None = None
     record_id: int | None = None
@@ -989,12 +989,19 @@ def iter_unique_targets(
     return targets
 
 
-def build_ip_address_payload(ip: str, hostname: str | None = None) -> dict[str, str]:
+def build_ip_address_payload(
+    ip: str,
+    hostname: str | None = None,
+    *,
+    tag_slug: str | None = None,
+) -> dict[str, Any]:
     address = ipaddress.ip_address(ip)
     cidr = 32 if address.version == 4 else 128
-    payload = {"address": f"{address}/{cidr}", "status": "active"}
+    payload: dict[str, Any] = {"address": f"{address}/{cidr}", "status": "active"}
     if hostname:
         payload["dns_name"] = hostname
+    if tag_slug:
+        payload["tags"] = [{"slug": tag_slug}]
     return payload
 
 
@@ -1076,12 +1083,25 @@ def evaluate_existing_ip_address(
     *,
     ip: str,
     hostname: str | None,
-    payload: dict[str, str],
+    payload: dict[str, Any],
+    apply_checkmk_tag: bool = False,
+    checkmk_tag_slug: str = "checkmk",
 ) -> IpAddressWriteResult:
     netbox_dns = record_dns_name(existing)
     verified = normalize_hostname(hostname)
     record_id = record_id_value(existing) or None
+    tag_slug = checkmk_tag_slug if apply_checkmk_tag else None
+    needs_tag = bool(tag_slug and tag_slug.lower() not in record_tag_slugs(existing))
     if netbox_dns == verified:
+        if needs_tag:
+            return IpAddressWriteResult(
+                status="tag_update",
+                payload=payload,
+                netbox_dns_name=netbox_dns or None,
+                previous_dns_name=netbox_dns or None,
+                record_id=record_id,
+                update_payload=build_tag_only_update(existing, tag_slug),
+            )
         return IpAddressWriteResult(
             status="already_exists",
             payload=payload,
@@ -1095,7 +1115,11 @@ def evaluate_existing_ip_address(
         netbox_dns_name=netbox_dns or None,
         previous_dns_name=netbox_dns or None,
         record_id=record_id,
-        update_payload=build_ip_address_update(existing, hostname),
+        update_payload=build_ip_address_update(
+            existing,
+            hostname,
+            tag_slug=tag_slug if apply_checkmk_tag else None,
+        ),
     )
 
 
@@ -1111,6 +1135,45 @@ def record_id_value(record: Any) -> int:
     return int(getattr(record, "id", 0) or 0)
 
 
+def record_tags(record: Any) -> list[Any]:
+    if isinstance(record, dict):
+        tags = record.get("tags")
+    else:
+        tags = getattr(record, "tags", None)
+    if isinstance(tags, list):
+        return tags
+    return []
+
+
+def record_tag_slugs(record: Any) -> set[str]:
+    slugs: set[str] = set()
+    for tag in record_tags(record):
+        if isinstance(tag, dict):
+            slug = tag.get("slug") or tag.get("name")
+        else:
+            slug = getattr(tag, "slug", None) or getattr(tag, "name", None)
+        if slug:
+            slugs.add(str(slug).lower())
+    return slugs
+
+
+def netbox_tags_payload(tag_slugs: Iterable[str]) -> list[dict[str, str]]:
+    return [{"slug": slug} for slug in sorted({slug.lower() for slug in tag_slugs if slug})]
+
+
+def merge_checkmk_tag(existing: Any, tag_slug: str) -> list[dict[str, str]]:
+    slugs = record_tag_slugs(existing)
+    slugs.add(tag_slug.lower())
+    return netbox_tags_payload(slugs)
+
+
+def build_tag_only_update(existing: Any, tag_slug: str) -> dict[str, Any]:
+    return {
+        "id": record_id_value(existing),
+        "tags": merge_checkmk_tag(existing, tag_slug),
+    }
+
+
 def format_previous_dns_name_note(previous_dns_name: str | None) -> str:
     previous = previous_dns_name.strip() if previous_dns_name else "(none)"
     return f"Previous dns_name: {previous} (netbox-scanner)"
@@ -1123,7 +1186,12 @@ def append_previous_dns_name_note(description: str, previous_dns_name: str | Non
     return f"{description.rstrip()}\n{note}"
 
 
-def build_ip_address_update(existing: Any, hostname: str | None) -> dict[str, Any]:
+def build_ip_address_update(
+    existing: Any,
+    hostname: str | None,
+    *,
+    tag_slug: str | None = None,
+) -> dict[str, Any]:
     ip = str(record_address(existing)).split("/")[0]
     payload = build_ip_address_payload(ip, hostname)
     old_dns = record_dns_name(existing)
@@ -1135,6 +1203,8 @@ def build_ip_address_update(existing: Any, hostname: str | None) -> dict[str, An
         update["dns_name"] = payload["dns_name"]
     elif old_dns:
         update["dns_name"] = ""
+    if tag_slug and tag_slug.lower() not in record_tag_slugs(existing):
+        update["tags"] = merge_checkmk_tag(existing, tag_slug)
     return update
 
 
@@ -1388,6 +1458,8 @@ class NetBoxClient:
         *,
         hostname: str | None,
         exc: Exception,
+        apply_checkmk_tag: bool = False,
+        checkmk_tag_slug: str = "checkmk",
     ) -> IpAddressWriteResult:
         existing = self._lookup_ip_address(ip)
         if existing is None:
@@ -1401,19 +1473,36 @@ class NetBoxClient:
         if existing is None:
             self._handle_request_error(exc)
 
-        payload = build_ip_address_payload(ip, hostname)
+        payload = build_ip_address_payload(
+            ip,
+            hostname,
+            tag_slug=checkmk_tag_slug if apply_checkmk_tag else None,
+        )
         evaluation = evaluate_existing_ip_address(
             existing,
             ip=ip,
             hostname=hostname,
             payload=payload,
+            apply_checkmk_tag=apply_checkmk_tag,
+            checkmk_tag_slug=checkmk_tag_slug,
         )
         if evaluation.status == "already_exists":
             return evaluation
         return self._apply_ip_address_update(evaluation, hostname=hostname)
 
-    def evaluate_ip_address(self, ip: str, hostname: str | None = None) -> IpAddressWriteResult:
-        payload = build_ip_address_payload(ip, hostname)
+    def evaluate_ip_address(
+        self,
+        ip: str,
+        hostname: str | None = None,
+        *,
+        apply_checkmk_tag: bool = False,
+        checkmk_tag_slug: str = "checkmk",
+    ) -> IpAddressWriteResult:
+        payload = build_ip_address_payload(
+            ip,
+            hostname,
+            tag_slug=checkmk_tag_slug if apply_checkmk_tag else None,
+        )
         existing = self._lookup_ip_address(ip)
         if existing is None:
             return IpAddressWriteResult(status="not_found", payload=payload)
@@ -1422,10 +1511,25 @@ class NetBoxClient:
             ip=ip,
             hostname=hostname,
             payload=payload,
+            apply_checkmk_tag=apply_checkmk_tag,
+            checkmk_tag_slug=checkmk_tag_slug,
         )
 
-    def upsert_ip_address(self, ip: str, hostname: str | None = None, *, dry_run: bool = False) -> IpAddressWriteResult:
-        evaluation = self.evaluate_ip_address(ip, hostname)
+    def upsert_ip_address(
+        self,
+        ip: str,
+        hostname: str | None = None,
+        *,
+        dry_run: bool = False,
+        apply_checkmk_tag: bool = False,
+        checkmk_tag_slug: str = "checkmk",
+    ) -> IpAddressWriteResult:
+        evaluation = self.evaluate_ip_address(
+            ip,
+            hostname,
+            apply_checkmk_tag=apply_checkmk_tag,
+            checkmk_tag_slug=checkmk_tag_slug,
+        )
         if evaluation.status == "already_exists":
             return evaluation
 
@@ -1438,12 +1542,18 @@ class NetBoxClient:
                 self.api.ipam.ip_addresses.create(evaluation.payload)
             except Exception as exc:
                 if is_duplicate_ip_address_error(exc):
-                    return self._upsert_after_duplicate_create(ip, hostname=hostname, exc=exc)
+                    return self._upsert_after_duplicate_create(
+                        ip,
+                        hostname=hostname,
+                        exc=exc,
+                        apply_checkmk_tag=apply_checkmk_tag,
+                        checkmk_tag_slug=checkmk_tag_slug,
+                    )
                 self._handle_request_error(exc)
             return IpAddressWriteResult(status="created", payload=evaluation.payload)
 
-        if evaluation.status == "drift":
-            if evaluation.update_payload is None:
+        if evaluation.status in ("drift", "tag_update"):
+            if evaluation.update_payload is None and evaluation.status == "drift":
                 existing = self._lookup_ip_address(ip)
                 if existing is not None:
                     evaluation = evaluate_existing_ip_address(
@@ -1451,6 +1561,8 @@ class NetBoxClient:
                         ip=ip,
                         hostname=hostname,
                         payload=evaluation.payload,
+                        apply_checkmk_tag=apply_checkmk_tag,
+                        checkmk_tag_slug=checkmk_tag_slug,
                     )
             return self._apply_ip_address_update(evaluation, hostname=hostname)
 

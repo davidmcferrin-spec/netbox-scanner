@@ -10,6 +10,8 @@ from netbox_scanner.netbox import (
     apply_skip_ranges,
     build_ip_address_update,
     duplicate_address_from_error,
+    evaluate_existing_ip_address,
+    merge_checkmk_tag,
     host_matches_address,
     is_duplicate_ip_address_error,
     is_no_data_provided_error,
@@ -140,6 +142,8 @@ class FakeIPAddressRecord:
             return self._record[name]
         if name in ("description", "dns_name"):
             return ""
+        if name == "tags":
+            return self._record.get("tags", [])
         raise AttributeError(name)
 
     def update(self, data):
@@ -149,6 +153,8 @@ class FakeIPAddressRecord:
             self._record["dns_name"] = data["dns_name"]
         if "description" in data:
             self._record["description"] = data["description"]
+        if "tags" in data:
+            self._record["tags"] = data["tags"]
         self._parent.updated.append({"id": self._record["id"], **data})
         return self._record
 
@@ -216,6 +222,8 @@ class FakeIPAddresses:
                         record["dns_name"] = payload["dns_name"]
                     if "description" in payload:
                         record["description"] = payload["description"]
+                    if "tags" in payload:
+                        record["tags"] = payload["tags"]
                     self.updated.append(payload)
                     updated.append(record)
                     break
@@ -769,6 +777,72 @@ class NetBoxTests(unittest.TestCase):
         self.assertEqual("already_exists", result.status)
         self.assertEqual([], ip_addresses.updated)
         self.assertEqual([], ip_addresses.created)
+
+    def test_evaluate_ip_address_requests_tag_update_when_dns_matches(self):
+        existing = {
+            "id": 2,
+            "address": "10.0.0.2/32",
+            "dns_name": "host.example.com",
+            "tags": [],
+        }
+        evaluation = evaluate_existing_ip_address(
+            existing,
+            ip="10.0.0.2",
+            hostname="host.example.com",
+            payload={"address": "10.0.0.2/32", "status": "active", "dns_name": "host.example.com"},
+            apply_checkmk_tag=True,
+            checkmk_tag_slug="checkmk",
+        )
+        self.assertEqual("tag_update", evaluation.status)
+        self.assertEqual([{"slug": "checkmk"}], evaluation.update_payload["tags"])
+
+    def test_merge_checkmk_tag_preserves_existing_tags(self):
+        existing = {"id": 1, "tags": [{"slug": "production"}]}
+        self.assertEqual(
+            [{"slug": "checkmk"}, {"slug": "production"}],
+            merge_checkmk_tag(existing, "checkmk"),
+        )
+
+    def test_upsert_ip_address_applies_checkmk_tag_on_create(self):
+        ip_addresses = FakeIPAddresses()
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.upsert_ip_address(
+            "10.0.0.3",
+            hostname="new.example.com",
+            dry_run=False,
+            apply_checkmk_tag=True,
+            checkmk_tag_slug="checkmk",
+        )
+
+        self.assertEqual("created", result.status)
+        record = ip_addresses.records["10.0.0.3/32"]
+        self.assertEqual([{"slug": "checkmk"}], record["tags"])
+
+    def test_upsert_ip_address_applies_checkmk_tag_when_already_exists(self):
+        ip_addresses = FakeIPAddresses(
+            {
+                "10.0.0.4/32": {
+                    "id": 4,
+                    "address": "10.0.0.4/32",
+                    "dns_name": "host.example.com",
+                    "tags": [],
+                }
+            }
+        )
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.upsert_ip_address(
+            "10.0.0.4",
+            hostname="host.example.com",
+            dry_run=False,
+            apply_checkmk_tag=True,
+            checkmk_tag_slug="checkmk",
+        )
+
+        self.assertEqual("updated", result.status)
+        record = ip_addresses.records["10.0.0.4/32"]
+        self.assertEqual([{"slug": "checkmk"}], record["tags"])
 
     def test_create_ip_address_creates_when_not_found(self):
         ip_addresses = FakeIPAddresses()

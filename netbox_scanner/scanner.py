@@ -10,11 +10,12 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 if __package__ is None:  # pragma: no cover - allow `python netbox_scanner/scanner.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from netbox_scanner.checkmk import CheckMKClient, should_apply_checkmk_tag
 from netbox_scanner.dns_verify import lookup_dns
 from netbox_scanner.netbox import (
     NetBoxClient,
@@ -80,7 +81,10 @@ class ScanResult:
     netbox_written: bool = False
     netbox_status: str = ""
     netbox_dns_name: str | None = None
-    netbox_payload: dict[str, str] | None = None
+    netbox_payload: dict[str, Any] | None = None
+    checkmk_monitored: bool | None = None
+    checkmk_host_name: str | None = None
+    checkmk_tag_applied: bool = False
 
 
 @dataclass(slots=True)
@@ -165,6 +169,7 @@ class NetworkScanner:
         config,
         netbox_client: NetBoxClient,
         *,
+        checkmk_client: CheckMKClient | None = None,
         dns_resolver=None,
         nmap_scanner=None,
         ping_runner: Callable[[str], bool] | None = None,
@@ -172,6 +177,7 @@ class NetworkScanner:
     ) -> None:
         self.config = config
         self.netbox_client = netbox_client
+        self.checkmk_client = checkmk_client
         self.dns_resolver = dns_resolver
         self._nmap_scanner = nmap_scanner
         self.ping_runner = ping_runner or self._ping_host
@@ -228,6 +234,13 @@ class NetworkScanner:
         result.forward_addresses = dns_result.forward_addresses
         if dns_result.ptr_hostname:
             summary.ptr_found += 1
+
+    def _apply_checkmk_lookup(self, result: ScanResult) -> None:
+        if not self.config.checkmk.enabled or self.checkmk_client is None:
+            return
+        lookup = self.checkmk_client.lookup_host_by_ip(result.ip)
+        result.checkmk_monitored = lookup.monitored
+        result.checkmk_host_name = lookup.host_name
 
     def run(
         self,
@@ -359,7 +372,19 @@ class NetworkScanner:
         auto_confirm: bool,
         approval_callback: Callable[[ScanResult], bool] | None,
     ) -> None:
-        evaluation = self.netbox_client.evaluate_ip_address(result.ip, hostname=hostname)
+        self._apply_checkmk_lookup(result)
+        apply_checkmk_tag = should_apply_checkmk_tag(
+            self.config.checkmk,
+            bool(result.checkmk_monitored),
+        )
+        checkmk_tag_slug = self.config.checkmk.tag_slug
+
+        evaluation = self.netbox_client.evaluate_ip_address(
+            result.ip,
+            hostname=hostname,
+            apply_checkmk_tag=apply_checkmk_tag,
+            checkmk_tag_slug=checkmk_tag_slug,
+        )
         result.netbox_payload = evaluation.payload
         result.netbox_dns_name = evaluation.netbox_dns_name
         result.netbox_status = evaluation.status
@@ -371,8 +396,9 @@ class NetworkScanner:
             return
 
         if dry_run:
-            if evaluation.status == "drift":
-                summary.netbox_drift += 1
+            if evaluation.status in ("drift", "tag_update"):
+                if evaluation.status == "drift":
+                    summary.netbox_drift += 1
                 result.netbox_payload = evaluation.update_payload or evaluation.payload
                 if not result.reason:
                     result.reason = "dry_run"
@@ -390,18 +416,37 @@ class NetworkScanner:
             result.reason = "not_confirmed"
             return
 
-        write_result = self.netbox_client.upsert_ip_address(result.ip, hostname=hostname, dry_run=False)
+        write_result = self.netbox_client.upsert_ip_address(
+            result.ip,
+            hostname=hostname,
+            dry_run=False,
+            apply_checkmk_tag=apply_checkmk_tag,
+            checkmk_tag_slug=checkmk_tag_slug,
+        )
         if write_result.status in ("created", "updated"):
             result.netbox_written = True
+            if apply_checkmk_tag:
+                result.checkmk_tag_applied = True
         result.netbox_status = write_result.status
-        result.reason = write_result.status
+        if write_result.status == "updated" and evaluation.status == "tag_update":
+            result.reason = "tag_update"
+        else:
+            result.reason = write_result.status
         if write_result.status == "created":
             summary.netbox_created += 1
         elif write_result.status == "updated":
             summary.netbox_updated += 1
-            self.logger.info(
-                "Updated NetBox %s dns_name from %r to %r",
-                result.ip,
-                evaluation.netbox_dns_name,
-                hostname,
-            )
+            if evaluation.status == "tag_update":
+                self.logger.info(
+                    "Tagged NetBox %s with %r (CheckMK host=%r)",
+                    result.ip,
+                    checkmk_tag_slug,
+                    result.checkmk_host_name,
+                )
+            else:
+                self.logger.info(
+                    "Updated NetBox %s dns_name from %r to %r",
+                    result.ip,
+                    evaluation.netbox_dns_name,
+                    hostname,
+                )

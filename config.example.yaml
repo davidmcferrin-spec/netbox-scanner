@@ -25,6 +25,32 @@ netbox:
 
 
 
+checkmk:
+
+  # Optional CheckMK 2.4+ REST integration (per-IP lookup during verified-host NetBox writes).
+
+  enabled: false
+
+  # Site base URL including any site path, e.g. https://checkmk.example.com/monitoring
+
+  base_url: "https://checkmk.example.com/monitoring"
+
+  automation_user: "automation"
+
+  automation_secret: "replace-me"
+
+  # NetBox tag slug to assign when CheckMK has a host for the IP (create in Extras → Tags first).
+
+  tag_slug: "checkmk"
+
+  timeout: 10
+
+  rate_limit: 0
+
+  verify_ssl: true
+
+
+
 dns:
 
   # Optional custom recursive resolvers for PTR/A lookups.

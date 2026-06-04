@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
+from .checkmk import CheckMKClient
 from .config import AppConfig, _select_config_path, configure_logging, load_config, validate_config
 from .netbox import (
     NetBoxClient,
@@ -202,6 +203,15 @@ def render_run_configuration(
     table.add_row("DNS timeout (s)", str(config.dns.timeout))
     table.add_row("NetBox HTTP timeout (s)", str(config.netbox.timeout))
     table.add_row("NetBox API delay (s)", str(config.netbox.rate_limit))
+    table.add_row("CheckMK", "enabled" if config.checkmk.enabled else "disabled")
+    if config.checkmk.enabled:
+        table.add_row("CheckMK URL", config.checkmk.base_url)
+        table.add_row(
+            "CheckMK automation user",
+            config.checkmk.automation_user or "missing",
+        )
+        table.add_row("CheckMK tag slug", config.checkmk.tag_slug)
+        table.add_row("CheckMK API delay (s)", str(config.checkmk.rate_limit))
 
     table.add_row("Skip range names", format_list_preview(skip_ranges))
     table.add_row("Skip range roles", format_list_preview(skip_roles))
@@ -267,6 +277,15 @@ def netbox_write_dns_name(result: ScanResult) -> str | None:
     return None
 
 
+def _payload_tag_slug(result: ScanResult) -> str | None:
+    tags = (result.netbox_payload or {}).get("tags")
+    if isinstance(tags, list) and tags:
+        first = tags[0]
+        if isinstance(first, dict) and first.get("slug"):
+            return str(first["slug"])
+    return None
+
+
 def format_dns_hostname_fields(result: ScanResult) -> str:
     ptr = result.ptr_hostname or "-"
     write_dns = netbox_write_dns_name(result) or "-"
@@ -289,22 +308,51 @@ def format_dns_hostname_fields(result: ScanResult) -> str:
     return "  ".join(parts)
 
 
+def format_checkmk_field(result: ScanResult) -> str | None:
+    if result.checkmk_monitored is None:
+        return None
+    if result.checkmk_monitored:
+        label = result.checkmk_host_name or "yes"
+        return f"CheckMK={label}"
+    return "CheckMK=no"
+
+
 def netbox_outcome_label(result: ScanResult) -> str:
     status = result.netbox_status or ""
     reason = result.reason or ""
     dns_name = netbox_write_dns_name(result)
 
-    if result.netbox_written and status == "created":
-        if dns_name:
-            return f"added to NetBox (dns_name={dns_name})"
-        return "added to NetBox (no dns_name)"
+    if result.netbox_written and status == "updated" and reason == "tag_update":
+        tag_slug = _payload_tag_slug(result) or "checkmk"
+        return f"tagged NetBox (tag={tag_slug})"
     if result.netbox_written and status == "updated":
         previous = result.netbox_dns_name or "(none)"
         if dns_name:
-            return f"updated NetBox (dns_name={dns_name}, was {previous})"
+            tag_note = ""
+            if result.checkmk_tag_applied:
+                tag_slug = _payload_tag_slug(result) or "checkmk"
+                tag_note = f", tag={tag_slug}"
+            return f"updated NetBox (dns_name={dns_name}, was {previous}{tag_note})"
+        if result.checkmk_tag_applied:
+            tag_slug = _payload_tag_slug(result) or "checkmk"
+            return f"updated NetBox (tag={tag_slug}, was {previous})"
         return f"updated NetBox (was {previous})"
+    if result.netbox_written and status == "created":
+        if dns_name:
+            tag_note = ""
+            if result.checkmk_tag_applied:
+                tag_slug = _payload_tag_slug(result) or "checkmk"
+                tag_note = f", tag={tag_slug}"
+            return f"added to NetBox (dns_name={dns_name}{tag_note})"
+        if result.checkmk_tag_applied:
+            tag_slug = _payload_tag_slug(result) or "checkmk"
+            return f"added to NetBox (tag={tag_slug})"
+        return "added to NetBox (no dns_name)"
     if status == "already_exists":
         return "already in NetBox"
+    if status == "tag_update" and reason == "dry_run":
+        tag_slug = _payload_tag_slug(result) or "checkmk"
+        return f"would tag NetBox (tag={tag_slug})"
     if status == "drift" and reason == "dry_run":
         previous = result.netbox_dns_name or "(none)"
         if dns_name:
@@ -340,8 +388,12 @@ def netbox_outcome_label(result: ScanResult) -> str:
 def format_verified_find_line(result: ScanResult, *, max_width: int | None = None) -> str:
     ports = ",".join(str(port) for port in result.open_ports) or "-"
     dns_fields = format_dns_hostname_fields(result)
+    checkmk_field = format_checkmk_field(result)
     netbox = netbox_outcome_label(result)
-    parts = [f"FIND {result.ip}", dns_fields, f"ports={ports}", f"NetBox: {netbox}"]
+    parts = [f"FIND {result.ip}", dns_fields]
+    if checkmk_field:
+        parts.append(checkmk_field)
+    parts.extend([f"ports={ports}", f"NetBox: {netbox}"])
     if max_width is None:
         return "  ".join(parts)
     return fit_line(parts, max_width)
@@ -692,7 +744,11 @@ def _run_scan_locked(
             f"{config.netbox.base_url.rstrip('/')}/api/status/"
         ) from exc
 
-    scanner = NetworkScanner(config=config, netbox_client=client)
+    scanner = NetworkScanner(
+        config=config,
+        netbox_client=client,
+        checkmk_client=CheckMKClient(config.checkmk) if config.checkmk.enabled else None,
+    )
 
     resolved = _resolve_scan_targets(
         client,

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .checkmk import CheckMKConfig
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - optional at test time
@@ -62,6 +64,7 @@ class ScannerConfig:
 @dataclass(slots=True)
 class AppConfig:
     netbox: NetBoxConfig = field(default_factory=NetBoxConfig)
+    checkmk: CheckMKConfig = field(default_factory=CheckMKConfig)
     dns: DNSConfig = field(default_factory=DNSConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     scanner: ScannerConfig = field(default_factory=ScannerConfig)
@@ -116,6 +119,7 @@ def load_config(path: str | None = None) -> AppConfig:
         raw = _load_yaml(config_path)
 
     netbox = raw.get("netbox", {})
+    checkmk = raw.get("checkmk", {})
     dns = raw.get("dns", {})
     logging_cfg = raw.get("logging", {})
     scanner = raw.get("scanner", {})
@@ -126,6 +130,16 @@ def load_config(path: str | None = None) -> AppConfig:
             api_token=str(netbox.get("api_token", "")),
             timeout=float(netbox.get("timeout", 30.0)),
             rate_limit=float(netbox.get("rate_limit", 0.0)),
+        ),
+        checkmk=CheckMKConfig(
+            enabled=bool(checkmk.get("enabled", False)),
+            base_url=str(checkmk.get("base_url", "")),
+            automation_user=str(checkmk.get("automation_user", "")),
+            automation_secret=str(checkmk.get("automation_secret", "")),
+            tag_slug=str(checkmk.get("tag_slug", CheckMKConfig().tag_slug)),
+            timeout=float(checkmk.get("timeout", CheckMKConfig().timeout)),
+            rate_limit=float(checkmk.get("rate_limit", CheckMKConfig().rate_limit)),
+            verify_ssl=bool(checkmk.get("verify_ssl", True)),
         ),
         dns=DNSConfig(
             servers=list(dns.get("servers", [])),
@@ -166,6 +180,19 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError(
             "NetBox api_token is required. Set netbox.api_token in your config file or pass --config."
         )
+    if config.checkmk.enabled:
+        if not config.checkmk.base_url.strip():
+            raise ValueError(
+                "checkmk.base_url is required when checkmk.enabled is true."
+            )
+        if not config.checkmk.automation_user.strip():
+            raise ValueError(
+                "checkmk.automation_user is required when checkmk.enabled is true."
+            )
+        if not config.checkmk.automation_secret.strip():
+            raise ValueError(
+                "checkmk.automation_secret is required when checkmk.enabled is true."
+            )
 
 
 PACKAGE_LOGGER_NAME = "netbox_scanner"
