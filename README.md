@@ -102,7 +102,7 @@ DNS (PTR, A, CNAME) is collected for reporting and as the `dns_name` written to 
 
 ### CheckMK tagging (optional)
 
-Set `checkmk.enabled: true` in your config to query CheckMK 2.4+ (Community Edition) for each **verified** host using the REST API (`host_config/collections/all` filtered by `attributes.ipaddress`). Create the NetBox tag first (Extras → Tags), then set `checkmk.tag_slug` (default `checkmk`). The tag is applied only when CheckMK returns a host for that IP; absence of the tag implies the host was not found in CheckMK (or has not been scanned as verified yet).
+Set `checkmk.enabled: true` in your config to query CheckMK 2.4+ (Community Edition) for each **verified** host using the REST API (`domain-types/host/collections/all` filtered by Livestatus `address`). Set `checkmk.base_url` to the CheckMK site root (e.g. `https://nagios.example.com/NewsNation`), not `/check_mk/api/1.0` — that suffix is appended automatically. Create the NetBox tag first (Extras → Tags), then set `checkmk.tag_slug` (default `checkmk`). The tag is applied only when CheckMK returns a host for that IP; absence of the tag implies the host was not found in CheckMK (or has not been scanned as verified yet). If TLS verification fails against your Nagios certificate, set `checkmk.verify_ssl: false`.
 
 Authentication uses `Authorization: Bearer <automation_user> <automation_secret>`. Each lookup is a separate API call (`checkmk.rate_limit` adds delay between calls). FIND lines include `CheckMK=yes`, `CheckMK=no`, or the CheckMK host name when enabled.
 

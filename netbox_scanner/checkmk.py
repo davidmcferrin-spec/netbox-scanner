@@ -12,7 +12,8 @@ from typing import Any, Callable
 
 LOGGER = logging.getLogger(__name__)
 
-HOST_CONFIG_COLLECTION = "domain-types/host_config/collections/all"
+HOST_COLLECTION = "domain-types/host/collections/all"
+CHECKMK_API_SUFFIX = "/check_mk/api/1.0"
 
 
 @dataclass(slots=True)
@@ -41,10 +42,17 @@ def normalize_checkmk_ip(ip: str) -> str:
     return str(ipaddress.ip_address(ip))
 
 
-def build_host_config_query(ip: str) -> str:
+def checkmk_api_root(base_url: str) -> str:
+    trimmed = base_url.rstrip("/")
+    if trimmed.endswith(CHECKMK_API_SUFFIX):
+        return trimmed
+    return f"{trimmed}{CHECKMK_API_SUFFIX}"
+
+
+def build_host_lookup_query(ip: str) -> str:
     normalized = normalize_checkmk_ip(ip)
     return json.dumps(
-        {"op": "=", "left": "attributes.ipaddress", "right": normalized},
+        {"op": "=", "left": "address", "right": normalized},
         separators=(",", ":"),
     )
 
@@ -53,7 +61,7 @@ def authorization_header(user: str, secret: str) -> str:
     return f"Bearer {user.strip()} {secret.strip()}"
 
 
-def parse_host_config_response(payload: Any) -> CheckMKLookupResult:
+def parse_host_lookup_response(payload: Any) -> CheckMKLookupResult:
     if not isinstance(payload, dict):
         return CheckMKLookupResult(monitored=False)
 
@@ -65,10 +73,20 @@ def parse_host_config_response(payload: Any) -> CheckMKLookupResult:
     if not isinstance(first, dict):
         return CheckMKLookupResult(monitored=True)
 
-    host_name = first.get("title") or first.get("id")
+    extensions = first.get("extensions")
+    host_name = None
+    if isinstance(extensions, dict):
+        host_name = extensions.get("name") or extensions.get("host_name")
+    if not host_name:
+        host_name = first.get("title") or first.get("id")
     if host_name is not None:
         host_name = str(host_name)
     return CheckMKLookupResult(monitored=True, host_name=host_name)
+
+
+# Backward-compatible aliases for tests and callers.
+build_host_config_query = build_host_lookup_query
+parse_host_config_response = parse_host_lookup_response
 
 
 HttpGet = Callable[[str, dict[str, str], float], tuple[int, str]]
@@ -87,22 +105,22 @@ class CheckMKClient:
 
     @property
     def api_root(self) -> str:
-        return f"{self.config.base_url.rstrip('/')}/check_mk/api/1.0"
+        return checkmk_api_root(self.config.base_url)
 
     def lookup_host_by_ip(self, ip: str) -> CheckMKLookupResult:
         if not self.config.enabled:
             return CheckMKLookupResult(monitored=False)
 
         self._sleep()
-        query = build_host_config_query(ip)
+        query = build_host_lookup_query(ip)
         params = urllib.parse.urlencode(
             [
                 ("query", query),
                 ("columns", "name"),
-                ("columns", "attributes.ipaddress"),
+                ("columns", "address"),
             ]
         )
-        url = f"{self.api_root}/{HOST_CONFIG_COLLECTION}?{params}"
+        url = f"{self.api_root}/{HOST_COLLECTION}?{params}"
         headers = {
             "Accept": "application/json",
             "Authorization": authorization_header(
@@ -129,7 +147,7 @@ class CheckMKClient:
             LOGGER.warning("CheckMK returned invalid JSON for %s: %s", ip, exc)
             return CheckMKLookupResult(monitored=False)
 
-        return parse_host_config_response(payload)
+        return parse_host_lookup_response(payload)
 
     def _sleep(self) -> None:
         if self.config.rate_limit <= 0:
