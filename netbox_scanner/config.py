@@ -78,6 +78,21 @@ class KeyValueFormatter(logging.Formatter):
         )
 
 
+class ConsoleLogFormatter(logging.Formatter):
+    """Short single-line records for stderr; keeps unattended output within ~80 columns."""
+
+    def __init__(self, max_width: int = 80) -> None:
+        super().__init__()
+        self.max_width = max_width
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = record.getMessage().replace("\n", " ")
+        line = f"{record.levelname}: {message}"
+        if len(line) <= self.max_width:
+            return line
+        return line[: self.max_width - 1] + "…"
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
     if yaml is None:
         raise RuntimeError("PyYAML is required to read configuration files.")
@@ -153,17 +168,25 @@ def validate_config(config: AppConfig) -> None:
         )
 
 
-def configure_logging(config: LoggingConfig) -> None:
+PACKAGE_LOGGER_NAME = "netbox_scanner"
+
+
+def configure_logging(config: LoggingConfig, *, console: bool = True) -> None:
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
-    root_logger.setLevel(getattr(logging, config.level, logging.INFO))
 
-    formatter = KeyValueFormatter()
+    level = getattr(logging, config.level, logging.INFO)
+    package_logger = logging.getLogger(PACKAGE_LOGGER_NAME)
+    package_logger.handlers.clear()
+    package_logger.setLevel(level)
+    package_logger.propagate = False
+
+    file_formatter = KeyValueFormatter()
     file_handler = logging.FileHandler(config.file)
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(file_formatter)
+    package_logger.addHandler(file_handler)
 
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(formatter)
-
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(stdout_handler)
+    if console:
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setFormatter(ConsoleLogFormatter())
+        package_logger.addHandler(console_handler)

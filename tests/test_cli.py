@@ -10,10 +10,12 @@ from netbox_scanner.cli import (
     ResolvedScanTargets,
     _clear_interactive_console,
     _scan_progress,
+    format_dns_hostname_fields,
     format_verified_find_line,
     main,
     netbox_outcome_label,
     render_run_configuration,
+    report_verified_find,
 )
 from netbox_scanner.netbox import RangeRecord
 from netbox_scanner.scanner import ScanResult
@@ -93,6 +95,45 @@ class CliTests(unittest.TestCase):
         self.assertIn("PTR=host.example.com", line)
         self.assertIn("dns_name=host.example.com", line)
         self.assertIn("added to NetBox (dns_name=host.example.com)", line)
+
+    def test_format_dns_hostname_fields_omits_redundant_already_exists_fields(self):
+        result = ScanResult(
+            ip="10.98.0.4",
+            liveness="verified",
+            ptr_hostname="host.nexstar.tv",
+            netbox_status="already_exists",
+            netbox_dns_name="host.nexstar.tv",
+            forward_addresses=["10.98.0.4"],
+            netbox_payload={
+                "address": "10.98.0.4/32",
+                "status": "active",
+                "dns_name": "host.nexstar.tv",
+            },
+        )
+        fields = format_dns_hostname_fields(result)
+        self.assertIn("PTR=host.nexstar.tv", fields)
+        self.assertNotIn("NetBox-dns_name=", fields)
+        self.assertNotIn("forward=", fields)
+        self.assertEqual("already in NetBox", netbox_outcome_label(result))
+
+    def test_report_verified_find_uses_progress_log_during_live_scan(self):
+        result = ScanResult(
+            ip="10.0.0.1",
+            liveness="verified",
+            open_ports=[22],
+            ptr_hostname="host.example.com",
+            netbox_status="already_exists",
+            netbox_dns_name="host.example.com",
+        )
+        progress = MagicMock()
+        progress.console = Console(file=StringIO(), width=80, force_terminal=False)
+
+        with patch("netbox_scanner.cli.console.print") as console_print:
+            report_verified_find(result, logger=None, progress=progress)
+
+        progress.log.assert_called_once()
+        console_print.assert_not_called()
+        self.assertIn("[bold green]FIND[/bold green]", progress.log.call_args.args[0])
 
     def test_netbox_outcome_label_for_dry_run(self):
         result = ScanResult(

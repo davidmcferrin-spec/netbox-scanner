@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -997,6 +998,90 @@ def build_ip_address_payload(ip: str, hostname: str | None = None) -> dict[str, 
     return payload
 
 
+_DUPLICATE_IP_ADDRESS_RE = re.compile(
+    r"Duplicate IP address found in global table:\s*([0-9a-fA-F:\.]+/\d+)",
+    re.IGNORECASE,
+)
+
+
+def record_address(record: Any) -> str:
+    if isinstance(record, dict):
+        return str(record.get("address") or "")
+    return str(getattr(record, "address", "") or "")
+
+
+def host_matches_address(ip: str, address_value: str) -> bool:
+    if not address_value:
+        return False
+    try:
+        return ipaddress.ip_address(ip) == ipaddress.ip_interface(address_value).ip
+    except ValueError:
+        return False
+
+
+def is_duplicate_ip_address_error(exc: Exception) -> bool:
+    try:
+        import pynetbox
+    except ImportError:  # pragma: no cover - optional at test time
+        return False
+    if not isinstance(exc, pynetbox.RequestError):
+        return False
+    status_code = getattr(getattr(exc, "req", None), "status_code", None)
+    if status_code != 400:
+        return False
+    blob = str(exc)
+    error = getattr(exc, "error", None)
+    if error is not None:
+        blob = f"{blob} {error!r}"
+    return "Duplicate IP address" in blob
+
+
+def duplicate_address_from_error(exc: Exception) -> str | None:
+    chunks: list[str] = [str(exc)]
+    error = getattr(exc, "error", None)
+    if isinstance(error, dict):
+        for messages in error.values():
+            if isinstance(messages, list):
+                chunks.extend(str(message) for message in messages)
+            else:
+                chunks.append(str(messages))
+    elif error is not None:
+        chunks.append(str(error))
+    for chunk in chunks:
+        match = _DUPLICATE_IP_ADDRESS_RE.search(chunk)
+        if match:
+            return match.group(1)
+    return None
+
+
+def evaluate_existing_ip_address(
+    existing: Any,
+    *,
+    ip: str,
+    hostname: str | None,
+    payload: dict[str, str],
+) -> IpAddressWriteResult:
+    netbox_dns = record_dns_name(existing)
+    verified = normalize_hostname(hostname)
+    record_id = record_id_value(existing) or None
+    if netbox_dns == verified:
+        return IpAddressWriteResult(
+            status="already_exists",
+            payload=payload,
+            netbox_dns_name=netbox_dns or None,
+            previous_dns_name=netbox_dns or None,
+            record_id=record_id,
+        )
+    return IpAddressWriteResult(
+        status="drift",
+        payload=payload,
+        netbox_dns_name=netbox_dns or None,
+        previous_dns_name=netbox_dns or None,
+        record_id=record_id,
+        update_payload=build_ip_address_update(existing, hostname),
+    )
+
+
 def record_description(record: Any) -> str:
     if isinstance(record, dict):
         return str(record.get("description") or "")
@@ -1047,6 +1132,11 @@ def record_dns_name(record: Any) -> str:
     if isinstance(record, dict):
         return normalize_hostname(record.get("dns_name"))
     return normalize_hostname(getattr(record, "dns_name", None))
+
+
+def _is_unsupported_filter(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "filter" in message and "host" in message
 
 
 class NetBoxClient:
@@ -1198,36 +1288,92 @@ class NetBoxClient:
             if range_is_excluded(record)
         ]
 
-    def evaluate_ip_address(self, ip: str, hostname: str | None = None) -> IpAddressWriteResult:
-        payload = build_ip_address_payload(ip, hostname)
+    def _lookup_ip_address(self, ip: str) -> Any | None:
+        payload = build_ip_address_payload(ip)
         self._sleep()
         try:
             existing = self.api.ipam.ip_addresses.get(address=payload["address"])
         except Exception as exc:
             self._handle_request_error(exc)
+        if existing is not None:
+            return existing
 
+        target = str(ipaddress.ip_address(ip))
+        matches: list[Any] = []
+        try:
+            matches = list(self.api.ipam.ip_addresses.filter(host=target))
+        except Exception as exc:
+            if not _is_unsupported_filter(exc):
+                self._handle_request_error(exc)
+
+        for record in matches:
+            if host_matches_address(ip, record_address(record)):
+                return record
+        return None
+
+    def _apply_ip_address_update(
+        self,
+        evaluation: IpAddressWriteResult,
+        *,
+        hostname: str | None,
+    ) -> IpAddressWriteResult:
+        update_payload = evaluation.update_payload
+        if update_payload is None:
+            raise RuntimeError("Missing NetBox update payload.")
+        self._sleep()
+        try:
+            self.api.ipam.ip_addresses.update([update_payload])
+        except Exception as exc:
+            self._handle_request_error(exc)
+        return IpAddressWriteResult(
+            status="updated",
+            payload=evaluation.payload,
+            update_payload=update_payload,
+            netbox_dns_name=evaluation.netbox_dns_name,
+            previous_dns_name=evaluation.previous_dns_name,
+            record_id=evaluation.record_id,
+        )
+
+    def _upsert_after_duplicate_create(
+        self,
+        ip: str,
+        *,
+        hostname: str | None,
+        exc: Exception,
+    ) -> IpAddressWriteResult:
+        existing = self._lookup_ip_address(ip)
+        if existing is None:
+            duplicate_cidr = duplicate_address_from_error(exc)
+            if duplicate_cidr:
+                self._sleep()
+                try:
+                    existing = self.api.ipam.ip_addresses.get(address=duplicate_cidr)
+                except Exception as lookup_exc:
+                    self._handle_request_error(lookup_exc)
+        if existing is None:
+            self._handle_request_error(exc)
+
+        payload = build_ip_address_payload(ip, hostname)
+        evaluation = evaluate_existing_ip_address(
+            existing,
+            ip=ip,
+            hostname=hostname,
+            payload=payload,
+        )
+        if evaluation.status == "already_exists":
+            return evaluation
+        return self._apply_ip_address_update(evaluation, hostname=hostname)
+
+    def evaluate_ip_address(self, ip: str, hostname: str | None = None) -> IpAddressWriteResult:
+        payload = build_ip_address_payload(ip, hostname)
+        existing = self._lookup_ip_address(ip)
         if existing is None:
             return IpAddressWriteResult(status="not_found", payload=payload)
-
-        netbox_dns = record_dns_name(existing)
-        verified = normalize_hostname(hostname)
-        record_id = record_id_value(existing) or None
-        if netbox_dns == verified:
-            return IpAddressWriteResult(
-                status="already_exists",
-                payload=payload,
-                netbox_dns_name=netbox_dns or None,
-                previous_dns_name=netbox_dns or None,
-                record_id=record_id,
-            )
-
-        return IpAddressWriteResult(
-            status="drift",
+        return evaluate_existing_ip_address(
+            existing,
+            ip=ip,
+            hostname=hostname,
             payload=payload,
-            netbox_dns_name=netbox_dns or None,
-            previous_dns_name=netbox_dns or None,
-            record_id=record_id,
-            update_payload=build_ip_address_update(existing, hostname),
         )
 
     def upsert_ip_address(self, ip: str, hostname: str | None = None, *, dry_run: bool = False) -> IpAddressWriteResult:
@@ -1243,27 +1389,22 @@ class NetBoxClient:
             try:
                 self.api.ipam.ip_addresses.create(evaluation.payload)
             except Exception as exc:
+                if is_duplicate_ip_address_error(exc):
+                    return self._upsert_after_duplicate_create(ip, hostname=hostname, exc=exc)
                 self._handle_request_error(exc)
             return IpAddressWriteResult(status="created", payload=evaluation.payload)
 
         if evaluation.status == "drift":
-            update_payload = evaluation.update_payload or build_ip_address_update(
-                self.api.ipam.ip_addresses.get(address=evaluation.payload["address"]),
-                hostname,
-            )
-            self._sleep()
-            try:
-                self.api.ipam.ip_addresses.update([update_payload])
-            except Exception as exc:
-                self._handle_request_error(exc)
-            return IpAddressWriteResult(
-                status="updated",
-                payload=evaluation.payload,
-                update_payload=update_payload,
-                netbox_dns_name=evaluation.netbox_dns_name,
-                previous_dns_name=evaluation.previous_dns_name,
-                record_id=evaluation.record_id,
-            )
+            if evaluation.update_payload is None:
+                existing = self._lookup_ip_address(ip)
+                if existing is not None:
+                    evaluation = evaluate_existing_ip_address(
+                        existing,
+                        ip=ip,
+                        hostname=hostname,
+                        payload=evaluation.payload,
+                    )
+            return self._apply_ip_address_update(evaluation, hostname=hostname)
 
         return evaluation
 

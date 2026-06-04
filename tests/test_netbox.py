@@ -1,3 +1,4 @@
+import ipaddress
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -7,6 +8,9 @@ from netbox_scanner.netbox import (
     NetBoxClient,
     append_previous_dns_name_note,
     apply_skip_ranges,
+    duplicate_address_from_error,
+    host_matches_address,
+    is_duplicate_ip_address_error,
     apply_skip_roles,
     build_skip_role_match_keys,
     collect_exclusion_ranges_for_prefixes,
@@ -29,6 +33,26 @@ from netbox_scanner.netbox import (
 )
 from netbox_scanner.netbox import RangeRecord
 from netbox_scanner.scanner import is_excluded, range_records_to_exclusions
+
+
+def make_duplicate_ip_request_error(existing_address: str):
+    try:
+        import json
+
+        import pynetbox
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("pynetbox is required for duplicate IP tests.") from exc
+
+    body = {"address": [f"Duplicate IP address found in global table: {existing_address}"]}
+    req = SimpleNamespace(
+        status_code=400,
+        reason="Bad Request",
+        url="https://netbox.example.com/api/ipam/ip-addresses/",
+        request=SimpleNamespace(body=None),
+        json=lambda: body,
+        text=json.dumps(body),
+    )
+    return pynetbox.RequestError(req)
 
 
 class FakeRoles:
@@ -91,9 +115,34 @@ class FakeIPAddresses:
     def get(self, address):
         return self.records.get(address)
 
+    def filter(self, **kwargs):
+        if "host" in kwargs:
+            target = ipaddress.ip_address(kwargs["host"])
+            return [
+                record
+                for address, record in self.records.items()
+                if ipaddress.ip_interface(address).ip == target
+            ]
+        if "address" in kwargs:
+            record = self.records.get(kwargs["address"])
+            return [record] if record else []
+        return []
+
     def create(self, payload):
+        new_address = payload["address"]
+        new_host = ipaddress.ip_interface(new_address).ip
+        for address in self.records:
+            if ipaddress.ip_interface(address).ip == new_host:
+                raise make_duplicate_ip_request_error(address)
+        record = {
+            **payload,
+            "id": len(self.records) + 1,
+            "address": new_address,
+            "description": payload.get("description", ""),
+        }
+        self.records[new_address] = record
         self.created.append(payload)
-        return payload
+        return record
 
     def update(self, payloads):
         updated = []
@@ -526,6 +575,54 @@ class NetBoxTests(unittest.TestCase):
         result = client.evaluate_ip_address("10.0.0.1", hostname="host.example.com")
 
         self.assertEqual("already_exists", result.status)
+
+    def test_evaluate_ip_address_finds_existing_host_with_different_prefix_length(self):
+        ip_addresses = FakeIPAddresses(
+            {
+                "10.98.0.10/22": {
+                    "id": 9,
+                    "address": "10.98.0.10/22",
+                    "dns_name": "host.nexstar.tv",
+                }
+            }
+        )
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.evaluate_ip_address("10.98.0.10", hostname="host.nexstar.tv")
+
+        self.assertEqual("already_exists", result.status)
+        self.assertEqual("host.nexstar.tv", result.netbox_dns_name)
+
+    def test_host_matches_address_compares_host_portion_only(self):
+        self.assertTrue(host_matches_address("10.98.0.10", "10.98.0.10/22"))
+        self.assertFalse(host_matches_address("10.98.0.10", "10.98.0.11/22"))
+
+    def test_duplicate_address_from_error_parses_netbox_message(self):
+        exc = make_duplicate_ip_request_error("10.98.0.10/22")
+        self.assertTrue(is_duplicate_ip_address_error(exc))
+        self.assertEqual("10.98.0.10/22", duplicate_address_from_error(exc))
+
+    def test_upsert_ip_address_recovers_from_duplicate_create_with_other_mask(self):
+        ip_addresses = FakeIPAddresses(
+            {
+                "10.98.0.10/22": {
+                    "id": 9,
+                    "address": "10.98.0.10/22",
+                    "dns_name": "old.nexstar.tv",
+                    "description": "keep",
+                }
+            }
+        )
+        client = NetBoxClient("https://netbox.example.com", "token", api=FakeAPI({}, ip_addresses))
+
+        result = client.upsert_ip_address("10.98.0.10", hostname="new.nexstar.tv", dry_run=False)
+
+        self.assertEqual("updated", result.status)
+        self.assertEqual([], ip_addresses.created)
+        self.assertEqual(1, len(ip_addresses.updated))
+        record = ip_addresses.records["10.98.0.10/22"]
+        self.assertEqual("new.nexstar.tv", record["dns_name"])
+        self.assertIn("Previous dns_name: old.nexstar.tv (netbox-scanner)", record["description"])
 
     def test_evaluate_ip_address_reports_drift(self):
         ip_addresses = FakeIPAddresses(

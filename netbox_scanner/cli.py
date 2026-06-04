@@ -31,7 +31,7 @@ from .selection import prompt_prefix_selection, render_prefix_scan_plan, render_
 from .terminal import effective_width, fit_line, format_list_preview, is_narrow
 
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = logging.getLogger("netbox_scanner.cli")
 console = Console()
 
 
@@ -162,6 +162,10 @@ def render_run_configuration(
     table.add_row("Config source", _config_source_label(config_path))
     table.add_row("Log level", config.logging.level)
     table.add_row("Log file", config.logging.file)
+    table.add_row(
+        "Log console",
+        "file only (Rich UI)" if interactive else "stderr (compact)",
+    )
 
     table.add_row("NetBox URL", config.netbox.base_url)
     table.add_row(
@@ -267,10 +271,21 @@ def format_dns_hostname_fields(result: ScanResult) -> str:
     ptr = result.ptr_hostname or "-"
     write_dns = netbox_write_dns_name(result) or "-"
     parts = [f"PTR={ptr}", f"dns_name={write_dns}"]
-    if result.netbox_dns_name and result.netbox_status in ("drift", "updated", "already_exists"):
+    if result.netbox_dns_name and result.netbox_status in ("drift", "updated"):
         parts.append(f"NetBox-dns_name={result.netbox_dns_name}")
-    if result.forward_addresses:
-        parts.append(f"forward={','.join(result.forward_addresses)}")
+    elif result.netbox_dns_name and result.netbox_status == "already_exists":
+        normalized_netbox = result.netbox_dns_name.rstrip(".").lower()
+        normalized_ptr = (result.ptr_hostname or "").rstrip(".").lower()
+        normalized_write = write_dns.rstrip(".").lower() if write_dns != "-" else ""
+        if normalized_netbox not in {normalized_ptr, normalized_write}:
+            parts.append(f"NetBox-dns_name={result.netbox_dns_name}")
+    forward = [
+        address
+        for address in result.forward_addresses
+        if address != result.ip
+    ]
+    if forward:
+        parts.append(f"forward={','.join(forward)}")
     return "  ".join(parts)
 
 
@@ -289,8 +304,6 @@ def netbox_outcome_label(result: ScanResult) -> str:
             return f"updated NetBox (dns_name={dns_name}, was {previous})"
         return f"updated NetBox (was {previous})"
     if status == "already_exists":
-        if result.netbox_dns_name:
-            return f"already in NetBox (dns_name={result.netbox_dns_name})"
         return "already in NetBox"
     if status == "drift" and reason == "dry_run":
         previous = result.netbox_dns_name or "(none)"
@@ -334,13 +347,16 @@ def format_verified_find_line(result: ScanResult, *, max_width: int | None = Non
     return fit_line(parts, max_width)
 
 
-def _print_find_line(display_line: str, *, output_console: Console) -> None:
+def _find_line_markup(display_line: str) -> str:
     if "NetBox: " in display_line:
         head, netbox = display_line.rsplit("NetBox: ", 1)
         head = head.replace("FIND", "[bold green]FIND[/bold green]", 1)
-        output_console.print(f"{head}NetBox: [cyan]{netbox}[/cyan]")
-        return
-    output_console.print(display_line.replace("FIND", "[bold green]FIND[/bold green]", 1))
+        return f"{head}NetBox: [cyan]{netbox}[/cyan]"
+    return display_line.replace("FIND", "[bold green]FIND[/bold green]", 1)
+
+
+def _print_find_line(display_line: str, *, output_console: Console) -> None:
+    output_console.print(_find_line_markup(display_line))
 
 
 def report_verified_find(
@@ -349,17 +365,26 @@ def report_verified_find(
     console: Console | None = None,
     logger: logging.Logger | None = None,
     print_to_console: bool = True,
+    progress: Progress | None = None,
 ) -> None:
     if result.liveness != "verified":
         return
     if logger is not None:
         logger.info(format_verified_find_line(result))
-    if print_to_console and console is not None:
-        display_line = format_verified_find_line(
-            result,
-            max_width=effective_width(console),
-        )
-        _print_find_line(display_line, output_console=console)
+    if not print_to_console:
+        return
+    output_console = console or (progress.console if progress is not None else None)
+    if output_console is None:
+        return
+    display_line = format_verified_find_line(
+        result,
+        max_width=effective_width(output_console),
+    )
+    markup = _find_line_markup(display_line)
+    if progress is not None:
+        progress.log(markup)
+        return
+    _print_find_line(display_line, output_console=output_console)
 
 
 def _render_summary(summary) -> None:
@@ -643,7 +668,7 @@ def _run_scan_locked(
     interactive: bool,
     scheduled: bool,
 ) -> None:
-    configure_logging(config.logging)
+    configure_logging(config.logging, console=not interactive)
     chosen_profile = profile or config.scanner.default_profile
     chosen_speed = speed or config.scanner.default_speed
     skip_ranges = _merge_skip_ranges(config, skip_range_flags)
@@ -763,7 +788,12 @@ def _run_scan_locked(
             )
 
             def progress_callback(summary, result):
-                report_verified_find(result, console=console, logger=LOGGER)
+                report_verified_find(
+                    result,
+                    console=console,
+                    logger=LOGGER,
+                    progress=progress,
+                )
                 progress.update(
                     task_id,
                     total=max(summary.total_hosts, 1),
